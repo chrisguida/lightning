@@ -1938,11 +1938,12 @@ finished:
 }
 
 void maybe_closeout_external_deposits(struct db *db,
-			              struct chain_event *ev)
+			              struct bitcoin_txid *txid,
+				      u32 blockheight)
 {
 	struct db_stmt *stmt;
 
-	assert(ev->spending_txid);
+	assert(txid);
 	stmt = db_prepare_v2(db, SQL("SELECT "
 				     "  e.id"
 				     " FROM chain_events e"
@@ -1954,7 +1955,7 @@ void maybe_closeout_external_deposits(struct db *db,
 
 	/* Blockheight for unconfirmeds is zero */
 	db_bind_int(stmt, 0);
-	db_bind_txid(stmt, ev->spending_txid);
+	db_bind_txid(stmt, txid);
 	db_bind_text(stmt, EXTERNAL_ACCT);
 	db_query_prepared(stmt);
 
@@ -1967,7 +1968,7 @@ void maybe_closeout_external_deposits(struct db *db,
 						    " blockheight = ?"
 						    " WHERE id = ?"));
 
-		db_bind_int(update_stmt, ev->blockheight);
+		db_bind_int(update_stmt, blockheight);
 		db_bind_u64(update_stmt, id);
 		db_exec_prepared_v2(take(update_stmt));
 	}
@@ -1975,14 +1976,14 @@ void maybe_closeout_external_deposits(struct db *db,
 	tal_free(stmt);
 }
 
-bool log_chain_event(struct db *db,
+bool log_chain_event(const tal_t *ctx, struct db *db,
 		     const struct account *acct,
 		     struct chain_event *e)
 {
 	struct db_stmt *stmt;
 
 	/* We're responsible for de-duping chain events! */
-	if (find_chain_event(e, db, acct,
+	if (find_chain_event(ctx, db, acct,
 			     &e->outpoint, e->spending_txid,
 			     e->tag))
 		return false;
@@ -2043,7 +2044,7 @@ bool log_chain_event(struct db *db,
 	db_exec_prepared_v2(stmt);
 	e->db_id = db_last_insert_id_v2(stmt);
 	e->acct_db_id = acct->db_id;
-	e->acct_name = tal_strdup(e, acct->name);
+	e->acct_name = tal_strdup(ctx, acct->name);
 	tal_free(stmt);
 	return true;
 }
