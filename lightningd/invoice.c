@@ -997,6 +997,17 @@ void invoice_check_onchain_payment(struct lightningd *ld,
 		return;
 	}
 
+	if (details->state == EXPIRED) {
+		// notify_expired_invoice_paid_onchain()
+		log_unusual(ld->log,
+					"On-chain payment received for expired "
+				    "invoice with label %s. Outpoint for "
+				    "received payment: %s ", details->label->s,
+					type_to_string(tmpctx, struct bitcoin_outpoint, outpoint)
+		);
+		return;
+	} 
+
 	invoice_try_pay(ld, NULL, details, msat, outpoint);
 }
 
