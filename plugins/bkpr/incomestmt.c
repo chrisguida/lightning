@@ -122,6 +122,7 @@ static struct income_event *maybe_chain_income(const tal_t *ctx,
 					       struct account *acct,
 					       struct chain_event *ev)
 {
+	fprintf(stderr, "CAG maybe_chain_income\n");
 	if (streq(ev->tag, "htlc_fulfill")) {
 		if (streq(ev->acct_name, EXTERNAL_ACCT))
 			/* Swap the credit/debit as it went to external */
@@ -149,10 +150,12 @@ static struct income_event *maybe_chain_income(const tal_t *ctx,
 
 	/* income */
 	if (streq(ev->tag, "deposit")) {
+		fprintf(stderr, "CAG maybe_chain_income deposit\n");
 		struct db_stmt *stmt;
 
 		/* deposit to external is cost to us */
 		if (streq(ev->acct_name, EXTERNAL_ACCT)) {
+			fprintf(stderr, "CAG maybe_chain_income deposit to external\n");
 			struct income_event *iev;
 
 			/* External deposits w/o a blockheight
@@ -176,26 +179,30 @@ static struct income_event *maybe_chain_income(const tal_t *ctx,
 		 * into a tx that included funds from a 3rd party
 		 * coming to us... eg. a splice out from the peer
 		 * to our onchain wallet */
+		fprintf(stderr, "CAG maybe_chain_income deposit\n");
 		stmt = db_prepare_v2(db, SQL("SELECT"
 					     "  1"
 					     " FROM chain_events e"
 					     " LEFT OUTER JOIN accounts a"
 					     " ON e.account_id = a.id"
 					     " WHERE "
-					     "  e.spending_txid = ?"));
+					     "  e.spending_txid = ? "
+						 " AND e.debit > ?"));
 
 		db_bind_txid(stmt, &ev->outpoint.txid);
+		db_bind_amount_msat(stmt, &ev->credit);
 		db_query_prepared(stmt);
 		if (!db_step(stmt)) {
 			tal_free(stmt);
 			/* no matching withdrawal from internal,
 			 * so must be new deposit (external) */
+			fprintf(stderr, "CAG maybe_chain_income no matching event found, new event is income\n");
 			return chain_to_income(ctx, ev,
 					       ev->acct_name,
 					       ev->credit,
 					       ev->debit);
 		}
-
+		fprintf(stderr, "CAG maybe_chain_income matching event found, new event is not income\n");
 		db_col_ignore(stmt, "1");
 		tal_free(stmt);
 		return NULL;
@@ -311,7 +318,7 @@ static struct onchain_fee **find_consolidated_fees(const tal_t *ctx,
 	tal_free(sums);
 	return fee_sums;
 }
-
+// fprintf(stderr, "CAG invoice_payment_deserialize outpoint: %s\n", type_to_string(tmpctx, struct bitcoin_outpoint, payload->outpoint));
 struct income_event **list_income_events(const tal_t *ctx,
 					 struct db *db,
 					 u64 start_time,
@@ -339,6 +346,8 @@ struct income_event **list_income_events(const tal_t *ctx,
 						       start_time, end_time);
 
 	evs = tal_arr(ctx, struct income_event *, 0);
+	fprintf(stderr, "CAG list_income_events!\n");
+	fprintf(stderr, "CAG list_income_events!\n");
 
 	for (size_t i = 0, j = 0, k = 0;
 	     i < tal_count(chain_events)
@@ -349,6 +358,8 @@ struct income_event **list_income_events(const tal_t *ctx,
 		struct chain_event *chain;
 		struct onchain_fee *fee;
 		u64 lowest = 0;
+
+		fprintf(stderr, "CAG list_income_events chain i = %ld, channel j = %ld, onchain_fee k = %ld\n", i, j, k);
 
 		if (i < tal_count(chain_events))
 			chain = chain_events[i];
@@ -363,31 +374,42 @@ struct income_event **list_income_events(const tal_t *ctx,
 		else
 			fee = NULL;
 
-		if (chain)
+		if (chain) {
 			lowest = chain->timestamp;
+		}
 
 		if (chan
-		    && (lowest == 0 || lowest > chan->timestamp))
+		    && (lowest == 0 || lowest > chan->timestamp)) {
 			lowest = chan->timestamp;
+			}
 
 		if (fee
-		    && (lowest == 0 || lowest > fee->timestamp))
+		    && (lowest == 0 || lowest > fee->timestamp)) {
 			lowest = fee->timestamp;
+			}
+
+		fprintf(stderr, "CAG list_income_events lowest = %lu\n", lowest);
+
 
 		/* chain events first, then channel events, then fees. */
 		if (chain && chain->timestamp == lowest) {
+			fprintf(stderr, "CAG list_income_events lowest is chain\n");
 			struct income_event *ev;
 			struct account *acct =
 				get_account(accts, chain->acct_db_id);
 
+			fprintf(stderr, "CAG list_income_events got acct = %s\n", acct->name);
 			ev = maybe_chain_income(evs, db, acct, chain);
-			if (ev)
+			if (ev) {
+				fprintf(stderr, "CAG list_income_events adding onchain income event\n");
 				tal_arr_expand(&evs, ev);
+			}
 			i++;
 			continue;
 		}
 
 		if (chan && chan->timestamp == lowest) {
+			fprintf(stderr, "CAG list_income_events lowest is channel\n");
 			struct income_event *ev;
 			ev = maybe_channel_income(evs, chan);
 			if (ev)
