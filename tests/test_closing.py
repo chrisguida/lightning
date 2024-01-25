@@ -20,6 +20,8 @@ import subprocess
 import threading
 import unittest
 
+# In msats
+SAT = 1000
 
 def test_closing_simple(node_factory, bitcoind, chainparams):
     coin_mvt_plugin = os.path.join(os.getcwd(), 'tests/plugins/coin_movements.py')
@@ -747,7 +749,6 @@ def test_penalty_outhtlc(node_factory, bitcoind, executor, chainparams, anchors)
     # We use a subset of tags in expected_2 that are used in expected_1
     tags = check_utxos_channel(l1, [channel_id], expected_1)
     check_utxos_channel(l2, [channel_id], expected_2, tags)
-
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
 @pytest.mark.openchannel('v2')

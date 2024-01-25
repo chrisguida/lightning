@@ -14,7 +14,7 @@ enum feature_place {
 	BOLT12_INVREQ_FEATURE,
 	BOLT12_INVOICE_FEATURE,
 };
-#define NUM_FEATURE_PLACE (BOLT12_INVOICE_FEATURE+1)
+#define NUM_FEATURE_PLACE (BOLT12_INVOICE_FEATURE + 1)
 extern const char *feature_place_names[NUM_FEATURE_PLACE];
 
 /* The complete set of features for all contexts */
@@ -26,23 +26,20 @@ struct feature_set {
 struct feature_set *feature_set_for_feature(const tal_t *ctx, int feature);
 
 /* Marshalling a feature set */
-struct feature_set *fromwire_feature_set(const tal_t *ctx,
-					 const u8 **ptr, size_t *max);
+struct feature_set *fromwire_feature_set(const tal_t *ctx, const u8 **ptr,
+					 size_t *max);
 void towire_feature_set(u8 **pptr, const struct feature_set *fset);
 
 /* a |= b, or returns false if features already in a */
-bool feature_set_or(struct feature_set *a,
-		    const struct feature_set *b TAKES);
+bool feature_set_or(struct feature_set *a, const struct feature_set *b TAKES);
 
 /* a - b, or returns false if features not already in a */
-bool feature_set_sub(struct feature_set *a,
-		     const struct feature_set *b TAKES);
+bool feature_set_sub(struct feature_set *a, const struct feature_set *b TAKES);
 
 /* Returns -1 if we're OK with all these offered features, otherwise first
  * unsupported (even) feature. */
 int features_unsupported(const struct feature_set *our_features,
-			 const u8 *their_features,
-			 enum feature_place p);
+			 const u8 *their_features, enum feature_place p);
 
 /* For the features in channel_announcement */
 u8 *get_agreed_channelfeatures(const tal_t *ctx,
@@ -59,8 +56,8 @@ bool feature_negotiated(const struct feature_set *our_features,
 /* Features can depend on other features: both must be set!
  * Sets @depender, @missing_dependency if returns false.
  */
-bool feature_check_depends(const u8 *their_features,
-			   size_t *depender, size_t *missing_dependency);
+bool feature_check_depends(const u8 *their_features, size_t *depender,
+			   size_t *missing_dependency);
 
 /* Return a list of what (init) features we advertize. */
 const char **list_supported_features(const tal_t *ctx,
@@ -92,12 +89,13 @@ struct feature_set *feature_set_dup(const tal_t *ctx,
  *
  * Flags are numbered from the least-significant bit, at bit 0 (i.e. 0x1,
  * an _even_ bit). They are generally assigned in pairs so that features
- * can be introduced as optional (_odd_ bits) and later upgraded to be compulsory
+ * can be introduced as optional (_odd_ bits) and later upgraded to be
+ * compulsory
  * (_even_ bits), which will be refused by outdated nodes:
  * see [BOLT #1: The `init` Message](01-messaging.md#the-init-message).
  */
-#define COMPULSORY_FEATURE(x)	((x) & 0xFFFFFFFE)
-#define OPTIONAL_FEATURE(x)	((x) | 1)
+#define COMPULSORY_FEATURE(x) ((x) & 0xFFFFFFFE)
+#define OPTIONAL_FEATURE(x) ((x) | 1)
 
 /* BOLT-a526652801a541ed33b34d000a3b686a857c811f #9:
  *
@@ -120,60 +118,65 @@ struct feature_set *feature_set_dup(const tal_t *ctx,
  * | 48/49 | `option_payment_metadata`         |...  9 ...
  * | 62/63 | `option_splice`                   |... IN ...
  */
-#define OPT_DATA_LOSS_PROTECT			0
-#define OPT_INITIAL_ROUTING_SYNC		2
-#define OPT_UPFRONT_SHUTDOWN_SCRIPT		4
-#define OPT_GOSSIP_QUERIES			6
-#define OPT_VAR_ONION				8
-#define OPT_GOSSIP_QUERIES_EX			10
-#define OPT_STATIC_REMOTEKEY			12
-#define OPT_PAYMENT_SECRET			14
-#define OPT_BASIC_MPP				16
-#define OPT_LARGE_CHANNELS			18
-#define OPT_ANCHOR_OUTPUTS			20
-#define OPT_ANCHORS_ZERO_FEE_HTLC_TX		22
-#define OPT_ROUTE_BLINDING 			24
-#define OPT_SHUTDOWN_ANYSEGWIT			26
-#define OPT_CHANNEL_TYPE			44
-#define OPT_PAYMENT_METADATA			48
+#define OPT_DATA_LOSS_PROTECT 0
+#define OPT_INITIAL_ROUTING_SYNC 2
+#define OPT_UPFRONT_SHUTDOWN_SCRIPT 4
+#define OPT_GOSSIP_QUERIES 6
+#define OPT_VAR_ONION 8
+#define OPT_GOSSIP_QUERIES_EX 10
+#define OPT_STATIC_REMOTEKEY 12
+#define OPT_PAYMENT_SECRET 14
+#define OPT_BASIC_MPP 16
+#define OPT_LARGE_CHANNELS 18
+#define OPT_ANCHOR_OUTPUTS 20
+#define OPT_ANCHORS_ZERO_FEE_HTLC_TX 22
+#define OPT_ROUTE_BLINDING 24
+#define OPT_SHUTDOWN_ANYSEGWIT 26
+#define OPT_CHANNEL_TYPE 44
+#define OPT_PAYMENT_METADATA 48
 
 /* BOLT-splice #9:
  * | 62/63 | `option_splice` |  ... IN ...
  */
-#define OPT_SPLICE				62
-#define OPT_EXPERIMENTAL_SPLICE			162
+#define OPT_SPLICE 62
+#define OPT_EXPERIMENTAL_SPLICE 162
 
 /* BOLT-f53ca2301232db780843e894f55d95d512f297f9 #9:
  * | 28/29 | `option_dual_fund` | ... IN9 ...
  */
-#define OPT_DUAL_FUND 				28
+#define OPT_DUAL_FUND 28
 
 /* BOLT-519be05f61e2c35ddf95b731203f89b4ee0946c3 #9:
  * | 46/47 | `option_scid_alias`              | ... IN ...
  * | 50/51 | `option_eroconf`                | ... IN ...
  */
-#define OPT_SCID_ALIAS                          46
-#define OPT_ZEROCONF                            50
+#define OPT_SCID_ALIAS 46
+#define OPT_ZEROCONF 50
 
 /* BOLT-quiescent #9:
  * | 34/35 | `option_quiesce` | ... IN ...
  */
-#define OPT_QUIESCE 				34
+#define OPT_QUIESCE 34
 
 /* BOLT-offers #9:
  *
  * | 38/39 | `option_onion_messages` |... IN ...
  */
-#define OPT_ONION_MESSAGES			38
+#define OPT_ONION_MESSAGES 38
 
-#define OPT_SHUTDOWN_WRONG_FUNDING		104
+#define OPT_SHUTDOWN_WRONG_FUNDING 104
 
 /* BOLT-peer-storage #9:
  *
- * | 40/41 | `want_peer_backup_storage`        | Want to use other nodes to store encrypted backup data    | IN ...
- * | 42/43 | `provide_peer_backup_storage`     | Can store other nodes' encrypted backup data              | IN ...
+ * | 40/41 | `want_peer_backup_storage`        | Want to use other nodes to
+ * store encrypted backup data    | IN ... | 42/43 |
+ * `provide_peer_backup_storage`     | Can store other nodes' encrypted backup
+ * data              | IN ...
  */
-#define OPT_WANT_PEER_BACKUP_STORAGE		40
-#define OPT_PROVIDE_PEER_BACKUP_STORAGE		42
+#define OPT_WANT_PEER_BACKUP_STORAGE 40
+#define OPT_PROVIDE_PEER_BACKUP_STORAGE 42
+
+/* `option_eltoo` | ... I ... */
+#define OPT_ELTOO 70
 
 #endif /* LIGHTNING_COMMON_FEATURES_H */

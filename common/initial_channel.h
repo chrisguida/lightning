@@ -8,6 +8,7 @@
 #include <common/channel_id.h>
 #include <common/derive_basepoints.h>
 #include <common/htlc.h>
+#include <common/keyset.h>
 
 struct signature;
 struct added_htlc;
@@ -71,6 +72,7 @@ struct channel {
 	struct height_states *blockheight_states;
 
 	/* What it looks like to each side. */
+    /* FIXME for eltoo, treating only LOCAL side as used... for now? */
 	struct channel_view view[NUM_SIDES];
 
 	/* Features which apply to this channel. */
@@ -81,6 +83,17 @@ struct channel {
 
 	/* When the lease expires for the funds in this channel */
 	u32 lease_expiry;
+
+    /* Eltoo fields below */
+
+    /* Keys, tx, and signing state used for the lifetime of the channel */
+    struct eltoo_keyset eltoo_keyset;
+
+	/* Mask for obscuring the encoding of the update number. */
+	u64 update_number_obscurer;
+
+    /* End Eltoo fields*/
+
 };
 
 /**

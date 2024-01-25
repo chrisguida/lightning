@@ -44,6 +44,7 @@ enum side {
 
 const char *htlc_state_name(enum htlc_state s);
 int htlc_state_flags(enum htlc_state state);
+int eltoo_htlc_state_flags(enum htlc_state state);
 
 static inline enum side htlc_state_owner(enum htlc_state state)
 {

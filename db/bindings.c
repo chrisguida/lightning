@@ -37,8 +37,8 @@ static bool db_column_null_warn(struct db_stmt *stmt, const char *colname,
 	if (!db_column_is_null(stmt, col))
 		return false;
 
-	db_warn(stmt->db, "Accessing a null column %s/%i in query %s",
-		colname, col, stmt->query->query);
+	db_warn(stmt->db, "Accessing a null column %s/%i in query %s", colname,
+		col, stmt->query->query);
 
 	return true;
 }
@@ -155,18 +155,16 @@ void db_bind_node_id(struct db_stmt *stmt, const struct node_id *id)
 	db_bind_blob(stmt, id->k, sizeof(id->k));
 }
 
-void db_bind_node_id_arr(struct db_stmt *stmt,
-			 const struct node_id *ids)
+void db_bind_node_id_arr(struct db_stmt *stmt, const struct node_id *ids)
 {
-	/* Copy into contiguous array: ARM will add padding to struct node_id! */
+	/* Copy into contiguous array: ARM will add padding to struct node_id!
+	 */
 	size_t n = tal_count(ids);
 	u8 *arr = tal_arr(stmt, u8, n * sizeof(ids[0].k));
 
 	for (size_t i = 0; i < n; ++i) {
 		assert(node_id_valid(&ids[i]));
-		memcpy(arr + sizeof(ids[i].k) * i,
-		       ids[i].k,
-		       sizeof(ids[i].k));
+		memcpy(arr + sizeof(ids[i].k) * i, ids[i].k, sizeof(ids[i].k));
 	}
 	db_bind_blob(stmt, arr, tal_count(arr));
 }
@@ -206,9 +204,20 @@ void db_bind_signature(struct db_stmt *stmt,
 	db_bind_blob(stmt, buf, 64);
 }
 
+void db_bind_partial_sig(struct db_stmt *stmt, int col,
+			 const struct partial_sig *psig)
+{
+	u8 *buf = tal_arr(stmt, u8, 32);
+	int ret = secp256k1_musig_partial_sig_serialize(secp256k1_ctx, buf,
+							&psig->p_sig);
+	assert(ret == 1);
+	db_bind_blob(stmt, col, buf, 32);
+}
+
 void db_bind_timeabs(struct db_stmt *stmt, struct timeabs t)
 {
-	u64 timestamp =  t.ts.tv_nsec + (((u64) t.ts.tv_sec) * ((u64) NSEC_IN_SEC));
+	u64 timestamp =
+	    t.ts.tv_nsec + (((u64)t.ts.tv_sec) * ((u64)NSEC_IN_SEC));
 	db_bind_u64(stmt, timestamp);
 }
 
@@ -227,20 +236,17 @@ void db_bind_psbt(struct db_stmt *stmt, const struct wally_psbt *psbt)
 	db_bind_blob(stmt, ser, bytes_written);
 }
 
-void db_bind_amount_msat(struct db_stmt *stmt,
-			 const struct amount_msat *msat)
+void db_bind_amount_msat(struct db_stmt *stmt, const struct amount_msat *msat)
 {
 	db_bind_u64(stmt, msat->millisatoshis); /* Raw: low level function */
 }
 
-void db_bind_amount_sat(struct db_stmt *stmt,
-			 const struct amount_sat *sat)
+void db_bind_amount_sat(struct db_stmt *stmt, const struct amount_sat *sat)
 {
 	db_bind_u64(stmt, sat->satoshis); /* Raw: low level function */
 }
 
-void db_bind_json_escape(struct db_stmt *stmt,
-			 const struct json_escape *esc)
+void db_bind_json_escape(struct db_stmt *stmt, const struct json_escape *esc)
 {
 	db_bind_text(stmt, esc->s);
 }
@@ -271,7 +277,6 @@ static const void *db_column_blob(struct db_stmt *stmt, int col)
 		return NULL;
 	return stmt->db->config->column_blob_fn(stmt, col);
 }
-
 
 u64 db_col_u64(struct db_stmt *stmt, const char *colname)
 {
@@ -318,31 +323,30 @@ const void *db_col_blob(struct db_stmt *stmt, const char *colname)
 	return stmt->db->config->column_blob_fn(stmt, col);
 }
 
-char *db_col_strdup(const tal_t *ctx,
-		    struct db_stmt *stmt,
-		    const char *colname)
+char *db_col_strdup(const tal_t *ctx, struct db_stmt *stmt, const char *colname)
 {
 	size_t col = db_query_colnum(stmt, colname);
 
 	if (db_column_null_warn(stmt, colname, col))
 		return NULL;
 
-	return tal_strdup(ctx, (char *)stmt->db->config->column_text_fn(stmt, col));
+	return tal_strdup(ctx,
+			  (char *)stmt->db->config->column_text_fn(stmt, col));
 }
 
-char *db_col_strdup_optional(const tal_t *ctx,
-			     struct db_stmt *stmt,
+char *db_col_strdup_optional(const tal_t *ctx, struct db_stmt *stmt,
 			     const char *colname)
 {
 	size_t col = db_query_colnum(stmt, colname);
 	if (db_column_is_null(stmt, col))
 		return NULL;
 
-	return tal_strdup(ctx, (char *)stmt->db->config->column_text_fn(stmt, col));
+	return tal_strdup(ctx,
+			  (char *)stmt->db->config->column_text_fn(stmt, col));
 }
 
 void db_col_preimage(struct db_stmt *stmt, const char *colname,
-			struct preimage *preimage)
+		     struct preimage *preimage)
 {
 	size_t col = db_query_colnum(stmt, colname);
 	const u8 *raw;
@@ -352,7 +356,8 @@ void db_col_preimage(struct db_stmt *stmt, const char *colname,
 	memcpy(preimage, raw, size);
 }
 
-void db_col_channel_id(struct db_stmt *stmt, const char *colname, struct channel_id *dest)
+void db_col_channel_id(struct db_stmt *stmt, const char *colname,
+		       struct channel_id *dest)
 {
 	size_t col = db_query_colnum(stmt, colname);
 
@@ -360,7 +365,8 @@ void db_col_channel_id(struct db_stmt *stmt, const char *colname, struct channel
 	memcpy(dest->id, db_column_blob(stmt, col), sizeof(dest->id));
 }
 
-void db_col_node_id(struct db_stmt *stmt, const char *colname, struct node_id *dest)
+void db_col_node_id(struct db_stmt *stmt, const char *colname,
+		    struct node_id *dest)
 {
 	size_t col = db_query_colnum(stmt, colname);
 
@@ -390,8 +396,7 @@ struct node_id *db_col_node_id_arr(const tal_t *ctx, struct db_stmt *stmt,
 	return ret;
 }
 
-void db_col_pubkey(struct db_stmt *stmt,
-		   const char *colname,
+void db_col_pubkey(struct db_stmt *stmt, const char *colname,
 		   struct pubkey *dest)
 {
 	size_t col = db_query_colnum(stmt, colname);
@@ -402,13 +407,12 @@ void db_col_pubkey(struct db_stmt *stmt,
 }
 
 void db_col_short_channel_id(struct db_stmt *stmt, const char *colname,
-				 struct short_channel_id *dest)
+			     struct short_channel_id *dest)
 {
 	dest->u64 = db_col_u64(stmt, colname);
 }
 
-void *db_col_optional_(tal_t *dst,
-		       struct db_stmt *stmt, const char *colname,
+void *db_col_optional_(tal_t *dst, struct db_stmt *stmt, const char *colname,
 		       void (*colfn)(struct db_stmt *, const char *, void *))
 {
 	if (db_col_is_null(stmt, colname))
@@ -418,8 +422,9 @@ void *db_col_optional_(tal_t *dst,
 	return dst;
 }
 
-struct short_channel_id *
-db_col_short_channel_id_arr(const tal_t *ctx, struct db_stmt *stmt, const char *colname)
+struct short_channel_id *db_col_short_channel_id_arr(const tal_t *ctx,
+						     struct db_stmt *stmt,
+						     const char *colname)
 {
 	size_t col = db_query_colnum(stmt, colname);
 	const u8 *ser;
@@ -443,7 +448,7 @@ db_col_short_channel_id_arr(const tal_t *ctx, struct db_stmt *stmt, const char *
 }
 
 bool db_col_signature(struct db_stmt *stmt, const char *colname,
-			 secp256k1_ecdsa_signature *sig)
+		      secp256k1_ecdsa_signature *sig)
 {
 	size_t col = db_query_colnum(stmt, colname);
 	assert(db_column_bytes(stmt, col) == 64);
@@ -458,10 +463,10 @@ struct timeabs db_col_timeabs(struct db_stmt *stmt, const char *colname)
 	t.ts.tv_sec = timestamp / NSEC_IN_SEC;
 	t.ts.tv_nsec = timestamp % NSEC_IN_SEC;
 	return t;
-
 }
 
-struct bitcoin_tx *db_col_tx(const tal_t *ctx, struct db_stmt *stmt, const char *colname)
+struct bitcoin_tx *db_col_tx(const tal_t *ctx, struct db_stmt *stmt,
+			     const char *colname)
 {
 	size_t col = db_query_colnum(stmt, colname);
 	const u8 *src = db_column_blob(stmt, col);
@@ -472,7 +477,8 @@ struct bitcoin_tx *db_col_tx(const tal_t *ctx, struct db_stmt *stmt, const char 
 	is_null = db_column_null_warn(stmt, colname, col);
 	tx = pull_bitcoin_tx(ctx, &src, &len);
 
-	if (is_null || tx) return tx;
+	if (is_null || tx)
+		return tx;
 
 	/* Column wasn't null, but we couldn't retrieve a valid wally_tx! */
 	u8 *tx_dup = tal_dup_arr(stmt, u8, src, len, 0);
@@ -483,7 +489,8 @@ struct bitcoin_tx *db_col_tx(const tal_t *ctx, struct db_stmt *stmt, const char 
 	return NULL;
 }
 
-struct wally_psbt *db_col_psbt(const tal_t *ctx, struct db_stmt *stmt, const char *colname)
+struct wally_psbt *db_col_psbt(const tal_t *ctx, struct db_stmt *stmt,
+			       const char *colname)
 {
 	struct wally_psbt *psbt;
 	size_t col = db_query_colnum(stmt, colname);
@@ -496,7 +503,8 @@ struct wally_psbt *db_col_psbt(const tal_t *ctx, struct db_stmt *stmt, const cha
 	return psbt;
 }
 
-struct bitcoin_tx *db_col_psbt_to_tx(const tal_t *ctx, struct db_stmt *stmt, const char *colname)
+struct bitcoin_tx *db_col_psbt_to_tx(const tal_t *ctx, struct db_stmt *stmt,
+				     const char *colname)
 {
 	struct wally_psbt *psbt = db_col_psbt(ctx, stmt, colname);
 	if (!psbt)
@@ -507,7 +515,8 @@ struct bitcoin_tx *db_col_psbt_to_tx(const tal_t *ctx, struct db_stmt *stmt, con
 struct channel_type *db_col_channel_type(const tal_t *ctx, struct db_stmt *stmt,
 					 const char *colname)
 {
-	return channel_type_from(ctx, take(db_col_arr(NULL, stmt, colname, u8)));
+	return channel_type_from(ctx,
+				 take(db_col_arr(NULL, stmt, colname, u8)));
 }
 
 void *db_col_arr_(const tal_t *ctx, struct db_stmt *stmt, const char *colname,
@@ -523,8 +532,10 @@ void *db_col_arr_(const tal_t *ctx, struct db_stmt *stmt, const char *colname,
 	sourcelen = db_column_bytes(stmt, col);
 
 	if (sourcelen % bytes != 0)
-		db_fatal(stmt->db, "%s: %s/%zu column size for %zu not a multiple of %s (%zu)",
-			 caller, colname, col, sourcelen, label, bytes);
+		db_fatal(
+		    stmt->db,
+		    "%s: %s/%zu column size for %zu not a multiple of %s (%zu)",
+		    caller, colname, col, sourcelen, label, bytes);
 
 	p = tal_arr_label(ctx, char, sourcelen, label);
 	if (sourcelen != 0)
@@ -532,8 +543,7 @@ void *db_col_arr_(const tal_t *ctx, struct db_stmt *stmt, const char *colname,
 	return p;
 }
 
-void db_col_amount_msat_or_default(struct db_stmt *stmt,
-				   const char *colname,
+void db_col_amount_msat_or_default(struct db_stmt *stmt, const char *colname,
 				   struct amount_msat *msat,
 				   struct amount_msat def)
 {
@@ -542,7 +552,8 @@ void db_col_amount_msat_or_default(struct db_stmt *stmt,
 	if (db_column_is_null(stmt, col))
 		*msat = def;
 	else
-		msat->millisatoshis = db_col_u64(stmt, colname); /* Raw: low level function */
+		msat->millisatoshis =
+		    db_col_u64(stmt, colname); /* Raw: low level function */
 }
 
 struct amount_msat db_col_amount_msat(struct db_stmt *stmt, const char *colname)
@@ -555,8 +566,8 @@ struct amount_sat db_col_amount_sat(struct db_stmt *stmt, const char *colname)
 	return amount_sat(db_col_u64(stmt, colname));
 }
 
-struct json_escape *db_col_json_escape(const tal_t *ctx,
-				       struct db_stmt *stmt, const char *colname)
+struct json_escape *db_col_json_escape(const tal_t *ctx, struct db_stmt *stmt,
+				       const char *colname)
 {
 	size_t col = db_query_colnum(stmt, colname);
 
@@ -564,7 +575,8 @@ struct json_escape *db_col_json_escape(const tal_t *ctx,
 				   db_column_bytes(stmt, col));
 }
 
-void db_col_sha256(struct db_stmt *stmt, const char *colname, struct sha256 *sha)
+void db_col_sha256(struct db_stmt *stmt, const char *colname,
+		   struct sha256 *sha)
 {
 	size_t col = db_query_colnum(stmt, colname);
 	const u8 *raw;
@@ -575,7 +587,7 @@ void db_col_sha256(struct db_stmt *stmt, const char *colname, struct sha256 *sha
 }
 
 void db_col_sha256d(struct db_stmt *stmt, const char *colname,
-		       struct sha256_double *shad)
+		    struct sha256_double *shad)
 {
 	size_t col = db_query_colnum(stmt, colname);
 	const u8 *raw;
@@ -594,20 +606,20 @@ void db_col_secret(struct db_stmt *stmt, const char *colname, struct secret *s)
 	memcpy(s, raw, sizeof(struct secret));
 }
 
-struct secret *db_col_secret_arr(const tal_t *ctx,
-				 struct db_stmt *stmt,
+struct secret *db_col_secret_arr(const tal_t *ctx, struct db_stmt *stmt,
 				 const char *colname)
 {
 	return db_col_arr(ctx, stmt, colname, struct secret);
 }
 
-void db_col_txid(struct db_stmt *stmt, const char *colname, struct bitcoin_txid *t)
+void db_col_txid(struct db_stmt *stmt, const char *colname,
+		 struct bitcoin_txid *t)
 {
 	db_col_sha256d(stmt, colname, &t->shad);
 }
 
-struct onionreply *db_col_onionreply(const tal_t *ctx,
-					struct db_stmt *stmt, const char *colname)
+struct onionreply *db_col_onionreply(const tal_t *ctx, struct db_stmt *stmt,
+				     const char *colname)
 {
 	struct onionreply *r = tal(ctx, struct onionreply);
 	r->contents = db_col_arr(ctx, stmt, colname, u8);

@@ -77,9 +77,27 @@ struct channel_config {
 	 * maximum dust exposure allowed for this channel
 	 */
 	struct amount_msat max_dust_htlc_exposure_msat;
+
+    /* Eltoo fields start here
+     *
+     * We do not use: to_self_delay, channel_reserve
+     */
+
+    bool is_eltoo;
+
+	/* BOLT #X:
+	 *
+     * `to_self_delay` is replaced with a symmetrical `shared_delay` which
+     * must be agreed upon by nodes. This is currently set by the opener.
+     */
+	u16 shared_delay;
+
+    /* Eltoo fields end here */
+
 };
 
 void towire_channel_config(u8 **pptr, const struct channel_config *config);
 void fromwire_channel_config(const u8 **ptr, size_t *max,
 			     struct channel_config *config);
+
 #endif /* LIGHTNING_COMMON_CHANNEL_CONFIG_H */

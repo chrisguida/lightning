@@ -166,6 +166,20 @@ static struct migration dbmigrations[] = {
 	 "  last_sig BLOB,"
 	 "  closing_fee_received INTEGER,"
 	 "  closing_sig_received BLOB,"
+     /* START Eltoo stuff*/
+	 "  last_complete_update_tx BLOB,"
+     "  last_complete_settle_tx BLOB,"
+	 "  last_committed_update_tx BLOB,"
+     "  last_committed_settle_tx BLOB,"
+     "  last_complete_their_psig BLOB,"
+     "  last_complete_our_psig BLOB,"
+     "  last_complete_session BLOB,"
+     "  last_committed_their_psig BLOB,"
+     "  last_committed_our_psig BLOB,"
+     "  last_committed_session BLOB,"
+     "  their_next_nonce BLOB,"
+     "  our_next_nonce BLOB,"
+     /* END Eltoo stuff */
 	 "  PRIMARY KEY (id)"
 	 ");"),
      NULL},
@@ -177,6 +191,7 @@ static struct migration dbmigrations[] = {
 	 "  htlc_minimum_msat BIGINT,"
 	 "  to_self_delay INTEGER,"
 	 "  max_accepted_htlcs INTEGER,"
+	 "  shared_delay INTEGER,"
 	 "  PRIMARY KEY (id)"
 	 ");"),
      NULL},

@@ -10,6 +10,98 @@
 #include <openingd/common.h>
 #include <wire/wire_sync.h>
 
+bool check_eltoo_config_bounds(const tal_t *ctx,
+			 struct amount_sat funding,
+			 u32 max_shared_delay,
+			 struct amount_msat min_effective_htlc_capacity,
+			 const struct channel_config *remoteconf,
+			 const struct channel_config *localconf,
+			 char **err_reason)
+{
+    /* For eltoo, funding is capacity always */
+	struct amount_sat capacity = funding;
+
+	/* BOLT #2:
+	 *
+	 * The receiving node MUST fail the channel if:
+	 *...
+	 *  - `to_self_delay` is unreasonably large.
+	 */
+	if (remoteconf->shared_delay > max_shared_delay) {
+		*err_reason = tal_fmt(ctx,
+				      "shared_delay %u larger than %u",
+				      remoteconf->shared_delay,
+				      max_shared_delay);
+		return false;
+	}
+
+	/* If they set the max HTLC value to less than that number, it caps
+	 * the channel capacity. */
+	if (amount_sat_greater(capacity,
+			       amount_msat_to_sat_round_down(remoteconf->max_htlc_value_in_flight)))
+		capacity = amount_msat_to_sat_round_down(remoteconf->max_htlc_value_in_flight);
+
+	/* If the minimum htlc is greater than the capacity, the channel is
+	 * useless. */
+	if (amount_msat_greater_sat(remoteconf->htlc_minimum, capacity)) {
+		*err_reason = tal_fmt(ctx, "htlc_minimum_msat %s"
+				      " too large for funding %s"
+				      " capacity_msat %s",
+				      type_to_string(ctx, struct amount_msat,
+						     &remoteconf->htlc_minimum),
+				      type_to_string(ctx, struct amount_sat,
+						     &funding),
+				      type_to_string(ctx, struct amount_sat,
+						     &capacity));
+		return false;
+	}
+
+	/* If the resulting channel doesn't meet our minimum "effective capacity"
+	 * set by lightningd, don't bother opening it. */
+	if (amount_msat_greater_sat(min_effective_htlc_capacity,
+				    capacity)) {
+		struct amount_sat min_effective_htlc_capacity_sat =
+			amount_msat_to_sat_round_down(min_effective_htlc_capacity);
+
+		*err_reason = tal_fmt(ctx,
+				      "channel capacity with funding %s,"
+				      " max_htlc_value_in_flight_msat is %s,"
+				      " channel capacity is %s, which is below %s",
+				      type_to_string(ctx, struct amount_sat,
+						     &funding),
+				      type_to_string(ctx, struct amount_msat,
+						     &remoteconf->max_htlc_value_in_flight),
+				      type_to_string(ctx, struct amount_sat,
+						     &capacity),
+				      type_to_string(ctx, struct amount_sat,
+						     &min_effective_htlc_capacity_sat));
+		return false;
+	}
+
+	/* We don't worry about how many HTLCs they accept, as long as > 0! */
+	if (remoteconf->max_accepted_htlcs == 0) {
+		*err_reason = tal_fmt(ctx,
+				      "max_accepted_htlcs %u invalid",
+				      remoteconf->max_accepted_htlcs);
+		return false;
+	}
+
+	/* BOLT #2:
+	 *
+	 * The receiving node MUST fail the channel if:
+	 *...
+	 *  - `max_accepted_htlcs` is greater than 483.
+	 */
+	if (remoteconf->max_accepted_htlcs > 483) {
+		*err_reason = tal_fmt(ctx,
+				      "max_accepted_htlcs %u too large",
+				      remoteconf->max_accepted_htlcs);
+		return false;
+	}
+
+	return true;
+}
+
 /*~ This is the key function that checks that their configuration is reasonable:
  * it applied for both the case where they're trying to open a channel, and when
  * they've accepted our open. */
@@ -291,3 +383,25 @@ void validate_initial_commitment_signature(int hsm_fd,
 			      tal_hex(tmpctx, msg));
 }
 
+void validate_initial_update_psig(int hsm_fd,
+                       struct channel_id *channel_id,
+                       struct bitcoin_tx *update_tx,
+                       struct partial_sig *p_sig)
+{
+    struct existing_htlc **htlcs;
+    const u8 *msg;
+
+    /* Validate the counterparty's partial signature. */
+    htlcs = tal_arr(NULL, struct existing_htlc *, 0);
+    msg = towire_hsmd_validate_update_tx_psig(NULL,
+                         channel_id,
+                         update_tx,
+                         p_sig);
+    tal_free(htlcs);
+    wire_sync_write(hsm_fd, take(msg));
+    msg = wire_sync_read(tmpctx, hsm_fd);
+    if (!fromwire_hsmd_validate_update_tx_psig_reply(msg))
+        status_failed(STATUS_FAIL_HSM_IO,
+                  "Reading hsmd_validate_update_tx_psig reply: %s",
+                  tal_hex(tmpctx, msg));
+}

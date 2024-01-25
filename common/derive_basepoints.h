@@ -10,7 +10,7 @@ struct sha256;
 
 struct basepoints {
 	struct pubkey revocation;
-	struct pubkey payment;
+	struct pubkey payment; /* re-used as "settlement pubkey" for eltoo */
 	struct pubkey htlc;
 	struct pubkey delayed_payment;
 };

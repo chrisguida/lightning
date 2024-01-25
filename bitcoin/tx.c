@@ -222,12 +222,56 @@ static struct wally_tx_input *wally_tx_input_from_outpoint_sequence(const struct
 	return tx_in;
 }
 
+int bitcoin_tx_add_unbound_input(struct bitcoin_tx *tx,
+			 u32 sequence,
+			 struct amount_sat amount,
+             const struct pubkey *inner_pubkey)
+{
+	int wally_err;
+	int input_num = tx->wtx->num_inputs;
+    /* PSBTs insist that a utxo is "real", insert garbage so we have value later */
+    struct bitcoin_outpoint fake_outpoint;
+    u8 *fake_script_pubkey = tal_arr(tx, u8, 1);
+
+    memset(fake_outpoint.txid.shad.sha.u.u8, 0x00, sizeof(fake_outpoint.txid.shad.sha.u.u8));
+    fake_outpoint.n = 0;
+
+    /* FIXME Put in PSBT */
+    assert(inner_pubkey);
+
+	psbt_append_input(tx->psbt, &fake_outpoint,
+			  sequence, /* scriptSig */ NULL,
+			  /* input_wscript */ NULL, /* redeemScript */ NULL);
+
+	psbt_input_set_wit_utxo(tx->psbt, input_num,
+				fake_script_pubkey, amount);
+
+	tal_wally_start();
+	wally_err = wally_tx_add_input(tx->wtx,
+				       &tx->psbt->tx->inputs[input_num]);
+	assert(wally_err == WALLY_OK);
+
+	tal_wally_end(tx->wtx);
+
+	if (is_elements(chainparams)) {
+		struct amount_asset asset;
+		/* FIXME: persist asset tags */
+		asset = amount_sat_to_asset(&amount,
+					    chainparams->fee_asset_tag);
+		/* FIXME: persist nonces */
+		psbt_elements_input_set_asset(tx->psbt, input_num, &asset);
+	}
+	return input_num;
+}
+
 int bitcoin_tx_add_input(struct bitcoin_tx *tx,
 			 const struct bitcoin_outpoint *outpoint,
 			 u32 sequence, const u8 *scriptSig,
 			 struct amount_sat amount, const u8 *scriptPubkey,
-			 const u8 *input_wscript)
+			 const u8 *input_wscript, const struct pubkey *inner_pubkey,
+             const u8 *tap_tree)
 {
+    /* FIXME use inner_pubkey and tap_tree */
 	int wally_err;
 	int input_num = tx->wtx->num_inputs;
 	struct wally_tx_input *tx_input;
@@ -263,6 +307,18 @@ int bitcoin_tx_add_input(struct bitcoin_tx *tx,
 		/* FIXME: persist nonces */
 	}
 	return input_num;
+}
+
+void bitcoin_tx_remove_input(struct bitcoin_tx *tx,
+            size_t index_num)
+{
+    int ok;
+    ok = wally_tx_remove_input(
+        tx->wtx,
+        index_num);
+    assert(ok == WALLY_OK);
+
+    psbt_rm_input(tx->psbt, index_num);
 }
 
 bool bitcoin_tx_check(const struct bitcoin_tx *tx)

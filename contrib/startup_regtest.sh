@@ -201,7 +201,7 @@ funder-lease-requests-only=false
 
 		# Start the lightning nodes
 		test -f "$LIGHTNING_DIR/l$i/lightningd-$network.pid" || \
-			$EATMYDATA "$LIGHTNINGD" "--network=$network" "--lightning-dir=$LIGHTNING_DIR/l$i" "--bitcoin-datadir=$BITCOIN_DIR" "--database-upgrade=true" &
+			$EATMYDATA "$LIGHTNINGD" "--network=$network" "--lightning-dir=$LIGHTNING_DIR/l$i" "--bitcoin-datadir=$BITCOIN_DIR" "--database-upgrade=true" "--dev-debugger=eltoo_onchaind" &
 		# shellcheck disable=SC2139 disable=SC2086
 		alias l$i-cli="$LCLI --lightning-dir=$LIGHTNING_DIR/l$i"
 		# shellcheck disable=SC2139 disable=SC2086
@@ -222,9 +222,9 @@ funder-lease-requests-only=false
 start_ln() {
 	# Start bitcoind in the background
 	test -f "$BITCOIN_DIR/regtest/bitcoind.pid" || \
-		"$BITCOIND" -datadir="$BITCOIN_DIR" -regtest -txindex -fallbackfee=0.00000253 -daemon
+		"$BITCOIND" -datadir="$BITCOIN_DIR" -regtest -txindex -fallbackfee=0.00000253 -daemon -daemonwait -trueoutputs=1 -annexcarrier=1
 
-	# Wait for it to start.
+	# Wait for it to start
 	while ! "$BCLI" -datadir="$BITCOIN_DIR" -regtest ping 2> /tmp/null; do echo "awaiting bitcoind..." && sleep 1; done
 
 	# Check if default wallet exists
@@ -374,6 +374,114 @@ fund_nodes() {
 		echo "done."
 
 	done
+}
+
+# These two scenarios are now covered in black box testing
+onchain_ln() {
+    # Test eltoo_onchaind handling
+    l1addr=$(l1-cli newaddr | jq -r .bech32)
+    l2id=$(l2-cli getinfo | jq -r .id)
+    bt-cli loadwallet "default"
+    btcaddr=$(bt-cli getnewaddress)
+    bt-cli sendtoaddress $l1addr 1
+    l1-cli connect $l2id@localhost:7272
+    bt-cli generatetoaddress 6 $btcaddr
+    sleep 5
+    l1-cli fundchannel $l2id 10000 normal false
+    bt-cli generatetoaddress 6 $btcaddr
+    sleep 5
+    FIRST_UPDATE_HEX=$(l1-cli listpeers | jq -r .peers[0].channels[0].last_update_tx )
+    FIRST_SETTLE_HEX=$(l1-cli listpeers | jq -r .peers[0].channels[0].last_settle_tx )
+    FIRST_UNBOUND_UPDATE_HEX=$(l1-cli listpeers | jq -r .peers[0].channels[0].unbound_update_tx )
+    FIRST_UNBOUND_SETTLE_HEX=$(l1-cli listpeers | jq -r .peers[0].channels[0].unbound_settle_tx )
+    invoice=$(l2-cli invoice 10000 hi "test" | jq -r .bolt11)
+    l1-cli pay $invoice
+    sleep 0.2
+
+    # Should be bound to funding output!
+    UPDATE_HEX=$(l1-cli listpeers | jq -r .peers[0].channels[0].last_update_tx )
+    SETTLE_HEX=$(l1-cli listpeers | jq -r .peers[0].channels[0].last_settle_tx )
+
+    ### THIS
+
+    # Test for latest update hitting chain
+    txid=$(bt-cli decoderawtransaction $UPDATE_HEX | jq -r .txid)
+    bt-cli prioritisetransaction $txid 0 100000000
+    txid=$(bt-cli decoderawtransaction $SETTLE_HEX | jq -r .txid)
+    bt-cli prioritisetransaction $txid 0 100000000
+    bt-cli sendrawtransaction $UPDATE_HEX
+    bt-cli generatetoaddress 7 $btcaddr
+    sleep 1
+    # settle tx should be pushed after next block
+    bt-cli generatetoaddress 1 $btcaddr
+
+    ### OR
+
+    # Test for old update hitting chain
+    txid=$(bt-cli decoderawtransaction $FIRST_UPDATE_HEX | jq -r .txid)
+    bt-cli prioritisetransaction $txid 0 100000000
+    bt-cli sendrawtransaction $FIRST_UPDATE_HEX
+    bt-cli generatetoaddress 1 $btcaddr
+    # Need to make sure onchaind are continuing first
+    sleep 1
+    # Should be re-bound now
+    UPDATE_HEX=$(l1-cli listpeers | jq -r .peers[0].channels[0].last_update_tx )
+    txid=$(bt-cli decoderawtransaction $UPDATE_HEX | jq -r .txid)
+    bt-cli prioritisetransaction $txid 0 100000000
+    bt-cli generatetoaddress 1 $btcaddr
+    # Make sure final update txn is rebroadcasted into mempool
+    sleep 1
+    bt-cli generatetoaddress 1 $btcaddr
+    SETTLE_HEX=$(l1-cli listpeers | jq -r .peers[0].channels[0].last_settle_tx )
+    txid=$(bt-cli decoderawtransaction $SETTLE_HEX | jq -r .txid)
+    bt-cli prioritisetransaction $txid 0 100000000
+    bt-cli generatetoaddress 6 $btcaddr
+    # Make sure settle txn is broadcasted into mempool
+    sleep 1
+    bt-cli generatetoaddress 1 $btcaddr
+}
+
+setup_ln() {
+    l2id=$(l2-cli getinfo | jq -r .id)
+    l3id=$(l3-cli getinfo | jq -r .id)
+    l1addr=$(l1-cli newaddr | jq -r .bech32)
+    l2addr=$(l2-cli newaddr | jq -r .bech32)
+    bt-cli loadwallet "default"
+    btcaddr=$(bt-cli getnewaddress)
+    bt-cli sendtoaddress $l1addr 1
+    bt-cli sendtoaddress $l2addr 1
+    l1-cli connect $l2id@localhost:7272
+    l2-cli connect $l3id@localhost:7373
+    l1-cli connect $l3id@localhost:7373
+    bt-cli generatetoaddress 6 $btcaddr
+    sleep 5
+    l1-cli fundchannel $l2id 10000 normal false
+    l2-cli fundchannel $l3id 10000 normal false
+    bt-cli generatetoaddress 6 $btcaddr
+
+    sleep 2
+    invoice=$(l2-cli invoice 10000 hi "test" | jq -r .bolt11)
+    l1-cli pay $invoice
+    sleep 0.5
+    invoice=$(l2-cli invoice 10000 hi2 "test" | jq -r .bolt11)
+    l1-cli pay $invoice
+    sleep 0.5
+    invoice=$(l2-cli invoice 1000000 hi3 "test" | jq -r .bolt11)
+    l1-cli pay $invoice
+    sleep 0.5
+    invoice=$(l1-cli invoice 500000 hi "test" | jq -r .bolt11)
+    l2-cli pay $invoice
+    sleep 0.5
+    invoice=$(l3-cli invoice 100000 hi "test" | jq -r .bolt11)
+    l2-cli pay $invoice
+
+    # We aren't announcing channels, yet, we're considered a "dead
+    # end", so shove in routehint
+    sleep 0.5
+    l3scid=$(l3-cli listchannels | jq -r .channels[0].short_channel_id)
+    echo $l3scid
+    invoice=$(l3-cli -k invoice msatoshi=10000 label=hi2 description="test" exposeprivatechannels="[${l3scid}]" | jq -r .bolt11)
+    l1-cli pay $invoice
 }
 
 stop_nodes() {

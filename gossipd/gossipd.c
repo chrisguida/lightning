@@ -53,7 +53,8 @@ bool peer_node_id_eq(const struct peer *peer, const struct node_id *node_id)
  * whole-channel flag which indicates it's not available; we use this when a
  * peer disconnects, and generate a `channel_update` to tell the world lazily
  * when someone asks. */
-static void peer_disable_channels(struct daemon *daemon, const struct node *node)
+static void peer_disable_channels(struct daemon *daemon,
+				  const struct node *node)
 {
 	/* If this peer had a channel with us, mark it disabled. */
 	struct chan_map_iter i;
@@ -94,7 +95,8 @@ static void destroy_peer(struct peer *peer)
 	struct node *node;
 
 	/* Remove it from the peers table */
-	peer_node_id_map_del(peer->daemon->peers, peer);;
+	peer_node_id_map_del(peer->daemon->peers, peer);
+	;
 
 	/* If we have a channel with this peer, disable it. */
 	node = get_node(peer->daemon->rstate, &peer->id);
@@ -112,8 +114,7 @@ struct peer *find_peer(struct daemon *daemon, const struct node_id *id)
 
 /* Increase a peer's gossip_counter, if peer not NULL */
 void peer_supplied_good_gossip(struct daemon *daemon,
-			       const struct node_id *source_peer,
-			       size_t amount)
+			       const struct node_id *source_peer, size_t amount)
 {
 	struct peer *peer;
 
@@ -139,8 +140,7 @@ void queue_peer_msg(struct peer *peer, const u8 *msg TAKES)
 }
 
 /*~ We have a helper for messages from the store. */
-void queue_peer_from_store(struct peer *peer,
-			   const struct broadcastable *bcast)
+void queue_peer_from_store(struct peer *peer, const struct broadcastable *bcast)
 {
 	struct gossip_store *gs = peer->daemon->rstate->gs;
 	queue_peer_msg(peer, take(gossip_store_get(NULL, gs, bcast->index)));
@@ -150,20 +150,16 @@ static void queue_priv_update(struct peer *peer,
 			      const struct broadcastable *bcast)
 {
 	struct gossip_store *gs = peer->daemon->rstate->gs;
-	queue_peer_msg(peer,
-		       take(gossip_store_get_private_update(NULL, gs,
-							    bcast->index)));
+	queue_peer_msg(peer, take(gossip_store_get_private_update(
+				 NULL, gs, bcast->index)));
 }
 
 /*~ We don't actually keep node_announcements in memory; we keep them in
  * a file called `gossip_store`.  If we need some node details, we reload
  * and reparse.  It's slow, but generally rare. */
-static bool get_node_announcement(const tal_t *ctx,
-				  struct daemon *daemon,
-				  const struct node *n,
-				  u8 rgb_color[3],
-				  u8 alias[32],
-				  u8 **features,
+static bool get_node_announcement(const tal_t *ctx, struct daemon *daemon,
+				  const struct node *n, u8 rgb_color[3],
+				  u8 alias[32], u8 **features,
 				  struct wireaddr **wireaddrs,
 				  struct lease_rates **rates)
 {
@@ -180,12 +176,9 @@ static bool get_node_announcement(const tal_t *ctx,
 	msg = gossip_store_get(tmpctx, daemon->rstate->gs, n->bcast.index);
 
 	/* Note: validity of node_id is already checked. */
-	if (!fromwire_node_announcement(ctx, msg,
-					&signature, features,
-					&timestamp,
-					&id, rgb_color, alias,
-					&addresses,
-					&na_tlvs)) {
+	if (!fromwire_node_announcement(ctx, msg, &signature, features,
+					&timestamp, &id, rgb_color, alias,
+					&addresses, &na_tlvs)) {
 		status_broken("Bad local node_announcement @%u: %s",
 			      n->bcast.index, tal_hex(tmpctx, msg));
 		return false;
@@ -211,11 +204,9 @@ static bool get_node_announcement(const tal_t *ctx,
 }
 
 /* Version which also does nodeid lookup */
-static bool get_node_announcement_by_id(const tal_t *ctx,
-					struct daemon *daemon,
+static bool get_node_announcement_by_id(const tal_t *ctx, struct daemon *daemon,
 					const struct node_id *node_id,
-					u8 rgb_color[3],
-					u8 alias[32],
+					u8 rgb_color[3], u8 alias[32],
 					u8 **features,
 					struct wireaddr **wireaddrs,
 					struct lease_rates **rates)
@@ -224,8 +215,8 @@ static bool get_node_announcement_by_id(const tal_t *ctx,
 	if (!n)
 		return false;
 
-	return get_node_announcement(ctx, daemon, n, rgb_color, alias,
-				     features, wireaddrs, rates);
+	return get_node_announcement(ctx, daemon, n, rgb_color, alias, features,
+				     wireaddrs, rates);
 }
 
 /*~Routines to handle gossip messages from peer, forwarded by subdaemons.
@@ -243,9 +234,8 @@ static bool get_node_announcement_by_id(const tal_t *ctx,
  * message, and puts the announcemnt on an internal 'pending'
  * queue.  We'll send a request to lightningd to look it up, and continue
  * processing in `handle_txout_reply`. */
-static const u8 *handle_channel_announcement_msg(struct daemon *daemon,
-						 const struct node_id *source_peer,
-						 const u8 *msg)
+static const u8 *handle_channel_announcement_msg(
+    struct daemon *daemon, const struct node_id *source_peer, const u8 *msg)
 {
 	const struct short_channel_id *scid;
 	const u8 *err;
@@ -254,21 +244,21 @@ static const u8 *handle_channel_announcement_msg(struct daemon *daemon,
 	 * if this is the unknown channel the peer was looking for (in
 	 * which case, it frees and NULLs that ptr) */
 	err = handle_channel_announcement(daemon->rstate, msg,
-					  daemon->current_blockheight,
-					  &scid, source_peer);
+					  daemon->current_blockheight, &scid,
+					  source_peer);
 	if (err)
 		return err;
 	else if (scid) {
 		/* We give them some grace period, in case we don't know about
 		 * block yet. */
-		if (daemon->current_blockheight == 0
-		    || !is_scid_depth_announceable(scid,
-						   daemon->current_blockheight)) {
+		if (daemon->current_blockheight == 0 ||
+		    !is_scid_depth_announceable(scid,
+						daemon->current_blockheight)) {
 			tal_arr_expand(&daemon->deferred_txouts, *scid);
 		} else {
-			daemon_conn_send(daemon->master,
-					 take(towire_gossipd_get_txout(NULL,
-								      scid)));
+			daemon_conn_send(
+			    daemon->master,
+			    take(towire_gossipd_get_txout(NULL, scid)));
 		}
 	}
 	return NULL;
@@ -290,11 +280,11 @@ static u8 *handle_channel_update_msg(struct peer *peer, const u8 *msg)
 	if (unknown_scid.u64 != 0)
 		query_unknown_channel(peer->daemon, peer, &unknown_scid);
 
-	/*~ As a nasty compromise in the spec, we only forward `channel_announce`
-	 * once we have a `channel_update`; the channel isn't *usable* for
-	 * routing until you have both anyway.  For this reason, we might have
-	 * just sent out our own channel_announce, so we check if it's time to
-	 * send a node_announcement too. */
+	/*~ As a nasty compromise in the spec, we only forward
+	 * `channel_announce` once we have a `channel_update`; the channel isn't
+	 * *usable* for routing until you have both anyway.  For this reason, we
+	 * might have just sent out our own channel_announce, so we check if
+	 * it's time to send a node_announcement too. */
 	maybe_send_own_node_announce(peer->daemon, false);
 	return NULL;
 }
@@ -311,25 +301,24 @@ static u8 *handle_node_announce(struct peer *peer, const u8 *msg)
 	return err;
 }
 
-static void handle_local_channel_announcement(struct daemon *daemon, const u8 *msg)
+static void handle_local_channel_announcement(struct daemon *daemon,
+					      const u8 *msg)
 {
 	u8 *cannouncement;
 	const u8 *err;
 	struct node_id id;
 
-	if (!fromwire_gossipd_local_channel_announcement(msg, msg,
-							 &id,
+	if (!fromwire_gossipd_local_channel_announcement(msg, msg, &id,
 							 &cannouncement))
 		master_badmsg(WIRE_GOSSIPD_LOCAL_CHANNEL_ANNOUNCEMENT, msg);
 
 	err = handle_channel_announcement_msg(daemon, &id, cannouncement);
 	if (err) {
-		status_peer_broken(&id, "invalid local_channel_announcement %s (%s)",
-				   tal_hex(tmpctx, msg),
-				   tal_hex(tmpctx, err));
+		status_peer_broken(&id,
+				   "invalid local_channel_announcement %s (%s)",
+				   tal_hex(tmpctx, msg), tal_hex(tmpctx, err));
 	}
 }
-
 
 /* channeld (via lightningd) tells us about (as-yet?) unannounce channel.
  * It needs us to put it in gossip_store. */
@@ -342,26 +331,23 @@ static void handle_local_private_channel(struct daemon *daemon, const u8 *msg)
 	const u8 *cannounce;
 	struct chan *zombie;
 
-	if (!fromwire_gossipd_local_private_channel(msg, msg,
-						    &id, &capacity, &scid,
-						    &features))
+	if (!fromwire_gossipd_local_private_channel(msg, msg, &id, &capacity,
+						    &scid, &features))
 		master_badmsg(WIRE_GOSSIPD_LOCAL_PRIVATE_CHANNEL, msg);
 
-	status_debug("received private channel announcement from channeld for %s",
-		     type_to_string(tmpctx, struct short_channel_id, &scid));
-	cannounce = private_channel_announcement(tmpctx,
-						 &scid,
-						 &daemon->id,
-						 &id,
-						 features);
+	status_debug(
+	    "received private channel announcement from channeld for %s",
+	    type_to_string(tmpctx, struct short_channel_id, &scid));
+	cannounce = private_channel_announcement(tmpctx, &scid, &daemon->id,
+						 &id, features);
 	/* If there is already a zombie announcement for this channel in the
 	 * store we can disregard this one. */
 	zombie = get_channel(daemon->rstate, &scid);
-	if (zombie && (zombie->half[0].zombie || zombie->half[1].zombie)){
-		status_debug("received channel announcement for %s,"
-			     " but it is a zombie; discarding",
-			     type_to_string(tmpctx, struct short_channel_id,
-				            &scid));
+	if (zombie && (zombie->half[0].zombie || zombie->half[1].zombie)) {
+		status_debug(
+		    "received channel announcement for %s,"
+		    " but it is a zombie; discarding",
+		    type_to_string(tmpctx, struct short_channel_id, &scid));
 		return;
 	}
 
@@ -389,8 +375,8 @@ static void handle_discovered_ip(struct daemon *daemon, const u8 *msg)
 					     &discovered_ip))
 			break;
 		tal_free(daemon->discovered_ip_v4);
-		daemon->discovered_ip_v4 = tal_dup(daemon, struct wireaddr,
-						 &discovered_ip);
+		daemon->discovered_ip_v4 =
+		    tal_dup(daemon, struct wireaddr, &discovered_ip);
 		goto update_node_annoucement;
 	case ADDR_TYPE_IPV6:
 		if (daemon->discovered_ip_v6 != NULL &&
@@ -398,8 +384,8 @@ static void handle_discovered_ip(struct daemon *daemon, const u8 *msg)
 					     &discovered_ip))
 			break;
 		tal_free(daemon->discovered_ip_v6);
-		daemon->discovered_ip_v6 = tal_dup(daemon, struct wireaddr,
-						 &discovered_ip);
+		daemon->discovered_ip_v6 =
+		    tal_dup(daemon, struct wireaddr, &discovered_ip);
 		goto update_node_annoucement;
 
 	/* ignore all other cases */
@@ -412,10 +398,12 @@ static void handle_discovered_ip(struct daemon *daemon, const u8 *msg)
 
 update_node_annoucement:
 	count_announceable = tal_count(daemon->announceable);
-	if ((daemon->ip_discovery == OPT_AUTOBOOL_AUTO && count_announceable == 0) ||
-	     daemon->ip_discovery == OPT_AUTOBOOL_TRUE)
-		status_debug("Update our node_announcement for discovered address: %s",
-			     fmt_wireaddr(tmpctx, &discovered_ip));
+	if ((daemon->ip_discovery == OPT_AUTOBOOL_AUTO &&
+	     count_announceable == 0) ||
+	    daemon->ip_discovery == OPT_AUTOBOOL_TRUE)
+		status_debug(
+		    "Update our node_announcement for discovered address: %s",
+		    fmt_wireaddr(tmpctx, &discovered_ip));
 	maybe_send_own_node_announce(daemon, false);
 }
 
@@ -434,7 +422,8 @@ static void dump_our_gossip(struct daemon *daemon, struct peer *peer)
 {
 	struct node *me;
 	struct chan_map_iter it;
-	const struct chan *chan, **chans = tal_arr(tmpctx, const struct chan *, 0);
+	const struct chan *chan,
+	    **chans = tal_arr(tmpctx, const struct chan *, 0);
 	size_t num_to_send;
 
 	/* Find ourselves; if no channels, nothing to send */
@@ -447,10 +436,11 @@ static void dump_our_gossip(struct daemon *daemon, struct peer *peer)
 		if (!is_chan_public(chan)) {
 			int dir = half_chan_idx(me, chan);
 
-			if (node_id_eq(&chan->nodes[!dir]->id, &peer->id)
-			    && is_halfchan_defined(&chan->half[dir])) {
+			if (node_id_eq(&chan->nodes[!dir]->id, &peer->id) &&
+			    is_halfchan_defined(&chan->half[dir])) {
 				/* There's no announce for this, of course! */
-				/* Private channel updates are wrapped in the store. */
+				/* Private channel updates are wrapped in the
+				 * store. */
 				queue_priv_update(peer, &chan->half[dir].bcast);
 			}
 			continue;
@@ -483,7 +473,8 @@ static void dump_our_gossip(struct daemon *daemon, struct peer *peer)
 		 * use our channel, so we care! */
 		for (int dir = 0; dir < 2; dir++) {
 			if (is_halfchan_defined(&chan->half[dir]))
-				queue_peer_from_store(peer, &chan->half[dir].bcast);
+				queue_peer_from_store(peer,
+						      &chan->half[dir].bcast);
 		}
 	}
 
@@ -500,15 +491,16 @@ static void connectd_new_peer(struct daemon *daemon, const u8 *msg)
 	struct node *node;
 
 	if (!fromwire_gossipd_new_peer(msg, &peer->id,
-				      &peer->gossip_queries_feature)) {
+				       &peer->gossip_queries_feature)) {
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Bad new_peer msg from connectd: %s",
 			      tal_hex(tmpctx, msg));
 	}
 
 	if (find_peer(daemon, &peer->id)) {
-		status_broken("Peer %s already here?",
-			      type_to_string(tmpctx, struct node_id, &peer->id));
+		status_broken(
+		    "Peer %s already here?",
+		    type_to_string(tmpctx, struct node_id, &peer->id));
 		tal_free(find_peer(daemon, &peer->id));
 	}
 
@@ -558,8 +550,7 @@ static void connectd_peer_gone(struct daemon *daemon, const u8 *msg)
 
 /*~ lightningd asks us if we know any addresses for a given id. */
 static struct io_plan *handle_get_address(struct io_conn *conn,
-					  struct daemon *daemon,
-					  const u8 *msg)
+					  struct daemon *daemon, const u8 *msg)
 {
 	struct node_id id;
 	u8 rgb_color[3];
@@ -571,9 +562,8 @@ static struct io_plan *handle_get_address(struct io_conn *conn,
 	if (!fromwire_gossipd_get_addrs(msg, &id))
 		master_badmsg(WIRE_GOSSIPD_GET_ADDRS, msg);
 
-	if (!get_node_announcement_by_id(tmpctx, daemon, &id,
-					 rgb_color, alias, &features, &addrs,
-					 &rates))
+	if (!get_node_announcement_by_id(tmpctx, daemon, &id, rgb_color, alias,
+					 &features, &addrs, &rates))
 		addrs = NULL;
 
 	daemon_conn_send(daemon->master,
@@ -596,9 +586,10 @@ static void handle_recv_gossip(struct daemon *daemon, const u8 *outermsg)
 
 	peer = find_peer(daemon, &id);
 	if (!peer) {
-		status_broken("connectd sent gossip msg %s from unknown peer %s",
-			      peer_wire_name(fromwire_peektype(msg)),
-			      type_to_string(tmpctx, struct node_id, &id));
+		status_broken(
+		    "connectd sent gossip msg %s from unknown peer %s",
+		    peer_wire_name(fromwire_peektype(msg)),
+		    type_to_string(tmpctx, struct node_id, &id));
 		return;
 	}
 
@@ -662,6 +653,18 @@ static void handle_recv_gossip(struct daemon *daemon, const u8 *outermsg)
 	case WIRE_OPEN_CHANNEL2:
 	case WIRE_ACCEPT_CHANNEL2:
 	case WIRE_ONION_MESSAGE:
+	/* Eltoo stuff */
+	case WIRE_OPEN_CHANNEL_ELTOO:
+	case WIRE_ACCEPT_CHANNEL_ELTOO:
+	case WIRE_FUNDING_CREATED_ELTOO:
+	case WIRE_FUNDING_LOCKED_ELTOO:
+	case WIRE_FUNDING_SIGNED_ELTOO:
+	case WIRE_UPDATE_SIGNED:
+	case WIRE_UPDATE_SIGNED_ACK:
+	case WIRE_CHANNEL_REESTABLISH_ELTOO:
+	case WIRE_SHUTDOWN_ELTOO:
+	case WIRE_CLOSING_SIGNED_ELTOO:
+		/* Eltoo stuff ends */
 	case WIRE_PEER_STORAGE:
 	case WIRE_YOUR_PEER_STORAGE:
 	case WIRE_STFU:
@@ -682,8 +685,7 @@ handled_msg:
 }
 
 /*~ connectd's input handler is very simple. */
-static struct io_plan *connectd_req(struct io_conn *conn,
-				    const u8 *msg,
+static struct io_plan *connectd_req(struct io_conn *conn, const u8 *msg,
 				    struct daemon *daemon)
 {
 	enum connectd_gossipd_wire t = fromwire_peektype(msg);
@@ -706,8 +708,8 @@ static struct io_plan *connectd_req(struct io_conn *conn,
 		break;
 	}
 
-	status_failed(STATUS_FAIL_INTERNAL_ERROR,
-		      "Bad msg from connectd2: %s", tal_hex(tmpctx, msg));
+	status_failed(STATUS_FAIL_INTERNAL_ERROR, "Bad msg from connectd2: %s",
+		      tal_hex(tmpctx, msg));
 
 handled:
 	return daemon_conn_read_next(conn, daemon->connectd);
@@ -728,13 +730,18 @@ static void gossip_refresh_network(struct daemon *daemon)
 	struct node *n;
 
 	/* Send out 1 day before deadline */
-	highwater = now - (GOSSIP_PRUNE_INTERVAL(daemon->rstate->dev_fast_gossip)
-			   - GOSSIP_BEFORE_DEADLINE(daemon->rstate->dev_fast_gossip_prune));
+	highwater =
+	    now -
+	    (GOSSIP_PRUNE_INTERVAL(daemon->rstate->dev_fast_gossip) -
+	     GOSSIP_BEFORE_DEADLINE(daemon->rstate->dev_fast_gossip_prune));
 
 	/* Schedule next run now */
-	notleak(new_reltimer(&daemon->timers, daemon,
-			     time_from_sec(GOSSIP_PRUNE_INTERVAL(daemon->rstate->dev_fast_gossip_prune)/4),
-			     gossip_refresh_network, daemon));
+	notleak(new_reltimer(
+	    &daemon->timers, daemon,
+	    time_from_sec(
+		GOSSIP_PRUNE_INTERVAL(daemon->rstate->dev_fast_gossip_prune) /
+		4),
+	    gossip_refresh_network, daemon));
 
 	/* Find myself in the network */
 	n = get_node(daemon->rstate, &daemon->id);
@@ -754,8 +761,8 @@ static void gossip_refresh_network(struct daemon *daemon)
 			hc = &c->half[direction];
 
 			if (!is_halfchan_defined(hc)) {
-				/* Connection is not announced yet, so don't even
-				 * try to re-announce it */
+				/* Connection is not announced yet, so don't
+				 * even try to re-announce it */
 				continue;
 			}
 
@@ -768,7 +775,8 @@ static void gossip_refresh_network(struct daemon *daemon)
 				     " for %s/%u",
 				     type_to_string(tmpctx,
 						    struct short_channel_id,
-						    &c->scid), direction);
+						    &c->scid),
+				     direction);
 			refresh_local_channel(daemon, c, direction);
 		}
 	}
@@ -804,13 +812,11 @@ static void tell_master_local_cupdates(struct daemon *daemon)
 		if (!is_halfchan_defined(hc))
 			continue;
 
-		cupdate = gossip_store_get(tmpctx,
-					   daemon->rstate->gs,
+		cupdate = gossip_store_get(tmpctx, daemon->rstate->gs,
 					   hc->bcast.index);
-		daemon_conn_send(daemon->master,
-				 take(towire_gossipd_init_cupdate(NULL,
-								  &c->scid,
-								  cupdate)));
+		daemon_conn_send(
+		    daemon->master,
+		    take(towire_gossipd_init_cupdate(NULL, &c->scid, cupdate)));
 	}
 }
 
@@ -820,8 +826,7 @@ struct peer *first_random_peer(struct daemon *daemon,
 	return peer_node_id_map_pick(daemon->peers, pseudorand_u64(), it);
 }
 
-struct peer *next_random_peer(struct daemon *daemon,
-			      const struct peer *first,
+struct peer *next_random_peer(struct daemon *daemon, const struct peer *first,
 			      struct peer_node_id_map_iter *it)
 {
 	struct peer *p;
@@ -852,25 +857,17 @@ static void gossip_init(struct daemon *daemon, const u8 *msg)
 	bool dev_fast_gossip, dev_fast_gossip_prune;
 	u32 timestamp;
 
-	if (!fromwire_gossipd_init(daemon, msg,
-				     &chainparams,
-				     &daemon->our_features,
-				     &daemon->id,
-				     daemon->rgb,
-				     daemon->alias,
-				     &daemon->announceable,
-				     &dev_gossip_time,
-				     &dev_fast_gossip,
-				     &dev_fast_gossip_prune,
-				     &daemon->ip_discovery)) {
+	if (!fromwire_gossipd_init(
+		daemon, msg, &chainparams, &daemon->our_features, &daemon->id,
+		daemon->rgb, daemon->alias, &daemon->announceable,
+		&dev_gossip_time, &dev_fast_gossip, &dev_fast_gossip_prune,
+		&daemon->ip_discovery)) {
 		master_badmsg(WIRE_GOSSIPD_INIT, msg);
 	}
 
-	daemon->rstate = new_routing_state(daemon,
-					   daemon,
-					   take(dev_gossip_time),
-					   dev_fast_gossip,
-					   dev_fast_gossip_prune);
+	daemon->rstate =
+	    new_routing_state(daemon, daemon, take(dev_gossip_time),
+			      dev_fast_gossip, dev_fast_gossip_prune);
 
 	/* Load stored gossip messages, get last modified time of file */
 	timestamp = gossip_store_load(daemon->rstate, daemon->rstate->gs);
@@ -886,16 +883,18 @@ static void gossip_init(struct daemon *daemon, const u8 *msg)
 	maybe_send_own_node_announce(daemon, true);
 
 	/* Start the twice- weekly refresh timer. */
-	notleak(new_reltimer(&daemon->timers, daemon,
-			     time_from_sec(GOSSIP_PRUNE_INTERVAL(daemon->rstate->dev_fast_gossip_prune) / 4),
-			     gossip_refresh_network, daemon));
+	notleak(new_reltimer(
+	    &daemon->timers, daemon,
+	    time_from_sec(
+		GOSSIP_PRUNE_INTERVAL(daemon->rstate->dev_fast_gossip_prune) /
+		4),
+	    gossip_refresh_network, daemon));
 
 	/* Fire up the seeker! */
 	daemon->seeker = new_seeker(daemon);
 
 	/* connectd is already started, and uses this fd to feed/recv gossip. */
-	daemon->connectd = daemon_conn_new(daemon, CONNECTD_FD,
-					   connectd_req,
+	daemon->connectd = daemon_conn_new(daemon, CONNECTD_FD, connectd_req,
 					   maybe_send_query_responses, daemon);
 	tal_add_destructor(daemon->connectd, master_or_connectd_gone);
 
@@ -904,19 +903,19 @@ static void gossip_init(struct daemon *daemon, const u8 *msg)
 	tell_master_local_cupdates(daemon);
 
 	/* OK, we are ready. */
-	daemon_conn_send(daemon->master,
-			 take(towire_gossipd_init_reply(NULL)));
+	daemon_conn_send(daemon->master, take(towire_gossipd_init_reply(NULL)));
 }
 
 static void new_blockheight(struct daemon *daemon, const u8 *msg)
 {
-	if (!fromwire_gossipd_new_blockheight(msg, &daemon->current_blockheight))
+	if (!fromwire_gossipd_new_blockheight(msg,
+					      &daemon->current_blockheight))
 		master_badmsg(WIRE_GOSSIPD_NEW_BLOCKHEIGHT, msg);
 
 	/* Check if we can now send any deferred queries. */
 	for (size_t i = 0; i < tal_count(daemon->deferred_txouts); i++) {
-		const struct short_channel_id *scid
-			= &daemon->deferred_txouts[i];
+		const struct short_channel_id *scid =
+		    &daemon->deferred_txouts[i];
 
 		if (!is_scid_depth_announceable(scid,
 						daemon->current_blockheight))
@@ -948,18 +947,17 @@ static void dev_gossip_memleak(struct daemon *daemon, const u8 *msg)
 	memleak_scan_htable(memtable, &daemon->peers->raw);
 
 	found_leak = dump_memleak(memtable, memleak_status_broken, NULL);
-	daemon_conn_send(daemon->master,
-			 take(towire_gossipd_dev_memleak_reply(NULL,
-							      found_leak)));
+	daemon_conn_send(daemon->master, take(towire_gossipd_dev_memleak_reply(
+					     NULL, found_leak)));
 }
 
 static void dev_compact_store(struct daemon *daemon, const u8 *msg)
 {
 	bool done = gossip_store_compact(daemon->rstate->gs);
 
-	daemon_conn_send(daemon->master,
-			 take(towire_gossipd_dev_compact_store_reply(NULL,
-								    done)));
+	daemon_conn_send(
+	    daemon->master,
+	    take(towire_gossipd_dev_compact_store_reply(NULL, done)));
 }
 
 static void dev_gossip_set_time(struct daemon *daemon, const u8 *msg)
@@ -969,7 +967,8 @@ static void dev_gossip_set_time(struct daemon *daemon, const u8 *msg)
 	if (!fromwire_gossipd_dev_set_time(msg, &time))
 		master_badmsg(WIRE_GOSSIPD_DEV_SET_TIME, msg);
 	if (!daemon->rstate->dev_gossip_time)
-		daemon->rstate->dev_gossip_time = tal(daemon->rstate, struct timeabs);
+		daemon->rstate->dev_gossip_time =
+		    tal(daemon->rstate, struct timeabs);
 	daemon->rstate->dev_gossip_time->ts.tv_sec = time;
 	daemon->rstate->dev_gossip_time->ts.tv_nsec = 0;
 }
@@ -983,18 +982,20 @@ static void handle_txout_reply(struct daemon *daemon, const u8 *msg)
 	struct amount_sat sat;
 	bool good;
 
-	if (!fromwire_gossipd_get_txout_reply(msg, msg, &scid, &sat, &outscript))
+	if (!fromwire_gossipd_get_txout_reply(msg, msg, &scid, &sat,
+					      &outscript))
 		master_badmsg(WIRE_GOSSIPD_GET_TXOUT_REPLY, msg);
 
 	/* Outscript is NULL if it's not an unspent output */
-	good = handle_pending_cannouncement(daemon, daemon->rstate,
-					    &scid, sat, outscript);
+	good = handle_pending_cannouncement(daemon, daemon->rstate, &scid, sat,
+					    outscript);
 
 	/* If we looking specifically for this, we no longer are. */
 	remove_unknown_scid(daemon->seeker, &scid, good);
 
 	/* Anywhere we might have announced a channel, we check if it's time to
-	 * announce ourselves (ie. if we just announced our own first channel) */
+	 * announce ourselves (ie. if we just announced our own first channel)
+	 */
 	maybe_send_own_node_announce(daemon, false);
 }
 
@@ -1015,12 +1016,12 @@ static void inject_gossip(struct daemon *daemon, const u8 *msg)
 		errmsg = handle_channel_announcement_msg(daemon, NULL, goss);
 		break;
 	case WIRE_NODE_ANNOUNCEMENT:
-		errmsg = handle_node_announcement(daemon->rstate, goss,
-						  NULL, NULL);
+		errmsg =
+		    handle_node_announcement(daemon->rstate, goss, NULL, NULL);
 		break;
 	case WIRE_CHANNEL_UPDATE:
-		errmsg = handle_channel_update(daemon->rstate, goss,
-					       NULL, NULL, true);
+		errmsg = handle_channel_update(daemon->rstate, goss, NULL, NULL,
+					       true);
 		break;
 	default:
 		err = tal_fmt(tmpctx, "unknown gossip type %i",
@@ -1114,8 +1115,7 @@ static void handle_local_channel_close(struct daemon *daemon, const u8 *msg)
 }
 
 /*~ This routine handles all the commands from lightningd. */
-static struct io_plan *recv_req(struct io_conn *conn,
-				const u8 *msg,
+static struct io_plan *recv_req(struct io_conn *conn, const u8 *msg,
 				struct daemon *daemon)
 {
 	enum gossipd_wire t = fromwire_peektype(msg);
@@ -1211,8 +1211,7 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	}
 
 	/* Master shouldn't give bad requests. */
-	status_failed(STATUS_FAIL_MASTER_IO, "%i: %s",
-		      t, tal_hex(tmpctx, msg));
+	status_failed(STATUS_FAIL_MASTER_IO, "%i: %s", t, tal_hex(tmpctx, msg));
 
 done:
 	return daemon_conn_read_next(conn, daemon->master);
@@ -1252,8 +1251,8 @@ int main(int argc, char *argv[])
 	timers_init(&daemon->timers, time_mono());
 
 	/* Our daemons always use STDIN for commands from lightningd. */
-	daemon->master = daemon_conn_new(daemon, STDIN_FILENO,
-					 recv_req, NULL, daemon);
+	daemon->master =
+	    daemon_conn_new(daemon, STDIN_FILENO, recv_req, NULL, daemon);
 	tal_add_destructor(daemon->master, master_or_connectd_gone);
 
 	status_setup_async(daemon->master);

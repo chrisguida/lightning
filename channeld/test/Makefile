@@ -17,16 +17,18 @@ CHANNELD_TEST_COMMON_OBJS :=			\
 	common/htlc_trim.o			\
 	common/htlc_tx.o			\
 	common/initial_commit_tx.o		\
+	common/initial_settlement_tx.o		\
 	common/key_derive.o			\
 	common/msg_queue.o			\
 	common/permute_tx.o			\
 	common/pseudorand.o			\
 	common/setup.o				\
 	common/type_to_string.o			\
+	common/update_tx.o		\
 	common/utils.o
 
 $(CHANNELD_TEST_PROGRAMS): $(BITCOIN_OBJS) $(WIRE_OBJS) $(CHANNELD_TEST_COMMON_OBJS)
 
-$(CHANNELD_TEST_OBJS): $(CHANNELD_HEADERS) $(CHANNELD_SRC)
+$(CHANNELD_TEST_OBJS): $(CHANNELD_HEADERS) $(CHANNELD_SRC) $(ELTOO_CHANNELD_SRC)
 
 check-units: $(CHANNELD_TEST_PROGRAMS:%=unittest/%)

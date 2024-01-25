@@ -71,18 +71,14 @@ u8 *hsmd_status_bad_request(struct hsmd_client *client, const u8 *msg,
 			    const char *error);
 
 /* Send a printf-style debugging trace. */
-void hsmd_status_fmt(enum log_level level,
-		const struct node_id *peer,
-		const char *fmt, ...)
-	PRINTF_FMT(3,4);
+void hsmd_status_fmt(enum log_level level, const struct node_id *peer,
+		     const char *fmt, ...) PRINTF_FMT(3, 4);
 
-#define hsmd_status_debug(...)				\
-	hsmd_status_fmt(LOG_DBG, NULL, __VA_ARGS__)
-#define hsmd_status_broken(...)				\
-	hsmd_status_fmt(LOG_BROKEN, NULL, __VA_ARGS__)
+#define hsmd_status_debug(...) hsmd_status_fmt(LOG_DBG, NULL, __VA_ARGS__)
+#define hsmd_status_broken(...) hsmd_status_fmt(LOG_BROKEN, NULL, __VA_ARGS__)
 
-void hsmd_status_failed(enum status_failreason code,
-			const char *fmt, ...) PRINTF_FMT(2,3);
+void hsmd_status_failed(enum status_failreason code, const char *fmt, ...)
+    PRINTF_FMT(2, 3);
 
 /* Given a message type and a client that sent the message, determine
  * whether the client was permitted to send such a message. */
@@ -93,5 +89,8 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 extern struct privkey *dev_force_privkey;
 /* If they specify --dev-force-bip32-seed it ends up in here. */
 extern struct secret *dev_force_bip32_seed;
+
+/* Hash function that just converts channel id into an int */
+size_t channel_id_key(const struct channel_id *id);
 
 #endif /* LIGHTNING_HSMD_LIBHSMD_H */

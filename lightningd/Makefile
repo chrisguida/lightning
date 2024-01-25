@@ -138,6 +138,7 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/trace.o				\
 	common/tx_roles.o			\
 	common/type_to_string.o			\
+    common/update_tx.o          \
 	common/utils.o				\
 	common/utxo.o				\
 	common/version.o			\

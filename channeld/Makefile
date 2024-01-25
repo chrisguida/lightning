@@ -8,6 +8,7 @@ CHANNELD_HEADERS :=			\
 	channeld/commit_tx.h			\
 	channeld/full_channel.h			\
 	channeld/full_channel_error.h		\
+    channeld/settle_tx.h            \
 	channeld/watchtower.h
 
 CHANNELD_SRC := channeld/channeld.c	\
@@ -16,15 +17,35 @@ CHANNELD_SRC := channeld/channeld.c	\
 	channeld/splice.c			\
 	channeld/inflight.c			\
 	channeld/channeld_wiregen.c		\
+    channeld/settle_tx.c            \
 	channeld/watchtower.c
 
 CHANNELD_OBJS := $(CHANNELD_SRC:.c=.o)
 $(CHANNELD_OBJS): $(CHANNELD_HEADERS)
 
+ELTOO_CHANNELD_HEADERS :=			\
+	channeld/full_channel_error_names_gen.h	\
+	channeld/channeld_wiregen.h		\
+	channeld/channeld_htlc.h		\
+	channeld/eltoo_channeld.h			\
+	channeld/eltoo_full_channel.h			\
+	channeld/full_channel_error.h		\
+    channeld/settle_tx.h            \
+	channeld/watchtower.h
+
+ELTOO_CHANNELD_SRC := channeld/eltoo_channeld.c	\
+	channeld/eltoo_full_channel.c			\
+	channeld/channeld_wiregen.c		\
+    channeld/settle_tx.c            \
+	channeld/watchtower.c
+
+ELTOO_CHANNELD_OBJS := $(ELTOO_CHANNELD_SRC:.c=.o)
+$(ELTOO_CHANNELD_OBJS): $(ELTOO_CHANNELD_HEADERS)
+
 # Make sure these depend on everything.
-ALL_C_SOURCES += $(CHANNELD_SRC)
-ALL_C_HEADERS += $(CHANNELD_HEADERS)
-ALL_PROGRAMS += lightningd/lightning_channeld
+ALL_C_SOURCES += $(ELTOO_CHANNELD_SRC) $(CHANNELD_SRC)
+ALL_C_HEADERS += $(ELTOO_CHANNELD_HEADERS) $(CHANNELD_HEADERS)
+ALL_PROGRAMS += lightningd/lightning_channeld lightningd/lightning_eltoo_channeld
 
 # Here's what lightningd depends on
 LIGHTNINGD_CONTROL_HEADERS += \
@@ -66,7 +87,9 @@ CHANNELD_COMMON_OBJS :=				\
 	common/htlc_tx.o			\
 	common/htlc_wire.o			\
 	common/initial_channel.o		\
+	common/initial_eltoo_channel.o		\
 	common/initial_commit_tx.o		\
+	common/initial_settlement_tx.o		\
 	common/keyset.o				\
 	common/key_derive.o			\
 	common/memleak.o			\
@@ -91,6 +114,7 @@ CHANNELD_COMMON_OBJS :=				\
 	common/subdaemon.o			\
 	common/timeout.o			\
 	common/type_to_string.o			\
+	common/update_tx.o		\
 	common/utils.o				\
 	common/utxo.o				\
 	common/version.o			\
@@ -105,5 +129,7 @@ channeld/full_channel_error_names_gen.h: channeld/full_channel_error.h ccan/ccan
 	ccan/ccan/cdump/tools/cdump-enumstr channeld/full_channel_error.h > $@
 
 lightningd/lightning_channeld: $(CHANNELD_OBJS) $(WIRE_ONION_OBJS) $(CHANNELD_COMMON_OBJS) $(WIRE_OBJS) $(BITCOIN_OBJS) $(HSMD_CLIENT_OBJS)
+
+lightningd/lightning_eltoo_channeld: $(ELTOO_CHANNELD_OBJS) $(WIRE_ONION_OBJS) $(CHANNELD_COMMON_OBJS) $(WIRE_OBJS) $(BITCOIN_OBJS) $(HSMD_CLIENT_OBJS)
 
 include channeld/test/Makefile

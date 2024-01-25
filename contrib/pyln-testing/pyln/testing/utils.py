@@ -403,7 +403,7 @@ class BitcoinD(TailableProc):
             os.makedirs(regtestdir)
 
         self.cmd_line = [
-            'bitcoind',
+            os.environ.get('BITCOIND_TEST_PATH', 'bitcoind'),
             '-datadir={}'.format(bitcoin_dir),
             '-printtoconsole',
             '-server',
@@ -417,6 +417,7 @@ class BitcoinD(TailableProc):
             '-debug=rpc',
             '-debug=validation',
         ]
+
         # For up to and including 0.16.1, this needs to be in main section.
         BITCOIND_CONFIG['rpcport'] = rpcport
         # For after 0.16.1 (eg. 3f398d7a17f136cd4a67998406ca41a124ae2966), this
@@ -1347,7 +1348,7 @@ class LightningNode(object):
         """Wait for onchaind to drop tx name to resolve (if any)"""
         if resolve:
             r = self.daemon.wait_for_log('Broadcasting {} .* to resolve {}'
-                                         .format(name, resolve))
+                                         .format(name, resolve, 1))
         else:
             r = self.daemon.wait_for_log('Broadcasting {} .* to resolve '
                                          .format(name))

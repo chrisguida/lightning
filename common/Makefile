@@ -51,6 +51,8 @@ COMMON_SRC_NOGEN :=				\
 	common/initial_channel.c		\
 	common/initial_commit_tx.c		\
 	common/invoice_path_id.c		\
+	common/initial_eltoo_channel.c		\
+	common/initial_settlement_tx.c		\
 	common/iso4217.c			\
 	common/json_filter.c			\
 	common/json_param.c			\
@@ -93,6 +95,7 @@ COMMON_SRC_NOGEN :=				\
 	common/trace.c				\
 	common/tx_roles.c			\
 	common/type_to_string.c			\
+	common/update_tx.c		\
 	common/utils.c				\
 	common/utxo.c				\
 	common/version.c			\

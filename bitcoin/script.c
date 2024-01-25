@@ -3,12 +3,15 @@
 #include <bitcoin/address.h>
 #include <bitcoin/locktime.h>
 #include <bitcoin/preimage.h>
+#include <bitcoin/privkey.h>
 #include <bitcoin/pubkey.h>
 #include <bitcoin/script.h>
 #include <ccan/endian/endian.h>
 #include <ccan/mem/mem.h>
 #include <common/utils.h>
 #include <sodium/randombytes.h>
+
+#include <stdio.h>
 
 /* To push 0-75 bytes onto stack. */
 #define OP_PUSHBYTES(val) (val)
@@ -29,10 +32,7 @@ static void add(u8 **scriptp, const void *mem, size_t len)
 	memcpy(*scriptp + oldlen, mem, len);
 }
 
-static void add_op(u8 **scriptp, u8 op)
-{
-	add(scriptp, &op, 1);
-}
+static void add_op(u8 **scriptp, u8 op) { add(scriptp, &op, 1); }
 
 void script_push_bytes(u8 **scriptp, const void *mem, size_t len)
 {
@@ -86,6 +86,22 @@ static void add_push_key(u8 **scriptp, const struct pubkey *key)
 	script_push_bytes(scriptp, der, sizeof(der));
 }
 
+static void add_push_xonly_key(u8 **scriptp, const struct pubkey *key)
+{
+	int ok;
+	unsigned char xonly_bytes[32];
+	secp256k1_xonly_pubkey xonly;
+
+	ok = secp256k1_xonly_pubkey_from_pubkey(
+	    secp256k1_ctx, &xonly, /* parity_bit */ NULL, &(key->pubkey));
+	assert(ok);
+	ok = secp256k1_xonly_pubkey_serialize(secp256k1_ctx, xonly_bytes,
+					      &xonly);
+	assert(ok);
+
+	script_push_bytes(scriptp, xonly_bytes, sizeof(xonly_bytes));
+}
+
 static void add_push_sig(u8 **scriptp, const struct bitcoin_signature *sig)
 {
 	u8 der[73];
@@ -109,6 +125,19 @@ static u8 *stack_sig(const tal_t *ctx, const struct bitcoin_signature *sig)
 	size_t len = signature_to_der(der, sig);
 
 	return tal_dup_arr(ctx, u8, der, len, 0);
+}
+
+static u8 *stack_bip340sig(const tal_t *ctx, const struct bip340sig *sig,
+			   enum sighash_type sh_type)
+{
+	if (sh_type != SIGHASH_DEFAULT) {
+		u8 sig_flag[65];
+		memcpy(sig_flag, sig->u8, 64);
+		sig_flag[sizeof(sig_flag) - 1] = sh_type;
+		return tal_dup_arr(ctx, u8, sig->u8, sizeof(sig_flag), 0);
+	} else {
+		return tal_dup_arr(ctx, u8, sig->u8, 64, 0);
+	}
 }
 
 static u8 *stack_preimage(const tal_t *ctx, const struct preimage *preimage)
@@ -135,8 +164,7 @@ static u8 *stack_number(const tal_t *ctx, unsigned int num)
 }
 
 /* tal_count() gives the length of the script. */
-u8 *bitcoin_redeem_2of2(const tal_t *ctx,
-			const struct pubkey *key1,
+u8 *bitcoin_redeem_2of2(const tal_t *ctx, const struct pubkey *key1,
 			const struct pubkey *key2)
 {
 	u8 *script = tal_arr(ctx, u8, 0);
@@ -226,16 +254,14 @@ u8 *bitcoin_redeem_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key)
 	return script;
 }
 
-u8 *bitcoin_scriptsig_redeem(const tal_t *ctx,
-			     const u8 *redeemscript TAKES)
+u8 *bitcoin_scriptsig_redeem(const tal_t *ctx, const u8 *redeemscript TAKES)
 {
 	u8 *script;
 
 	/* BIP141: The scriptSig must be exactly a push of the BIP16
 	 * redeemScript or validation fails. */
 	script = tal_arr(ctx, u8, 0);
-	script_push_bytes(&script, redeemscript,
-			  tal_count(redeemscript));
+	script_push_bytes(&script, redeemscript, tal_count(redeemscript));
 
 	if (taken(redeemscript))
 		tal_free(redeemscript);
@@ -245,8 +271,7 @@ u8 *bitcoin_scriptsig_redeem(const tal_t *ctx,
 
 u8 *bitcoin_scriptsig_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key)
 {
-	u8 *redeemscript =
-		bitcoin_redeem_p2sh_p2wpkh(NULL, key);
+	u8 *redeemscript = bitcoin_redeem_p2sh_p2wpkh(NULL, key);
 	return bitcoin_scriptsig_redeem(ctx, take(redeemscript));
 }
 
@@ -301,8 +326,8 @@ u8 *scriptpubkey_p2wpkh_derkey(const tal_t *ctx, const u8 der[33])
 	return script;
 }
 
-u8 *scriptpubkey_witness_raw(const tal_t *ctx, u8 version,
-			     const u8 *wprog, size_t wprog_size)
+u8 *scriptpubkey_witness_raw(const tal_t *ctx, u8 version, const u8 *wprog,
+			     size_t wprog_size)
 {
 	u8 *script = tal_arr(ctx, u8, 0);
 	add_number(&script, version);
@@ -319,15 +344,13 @@ u8 *scriptpubkey_raw_p2tr(const tal_t *ctx, const struct pubkey *output_pubkey)
 
 	add_op(&script, OP_1);
 
-	ok = secp256k1_xonly_pubkey_from_pubkey(secp256k1_ctx,
-		&x_key,
-		/* pk_parity */ NULL,
-		&(output_pubkey->pubkey));
+	ok = secp256k1_xonly_pubkey_from_pubkey(secp256k1_ctx, &x_key,
+						/* pk_parity */ NULL,
+						&(output_pubkey->pubkey));
 	assert(ok);
 
-	ok = secp256k1_xonly_pubkey_serialize(secp256k1_ctx,
-		x_key_bytes,
-		&x_key);
+	ok = secp256k1_xonly_pubkey_serialize(secp256k1_ctx, x_key_bytes,
+					      &x_key);
 	assert(ok);
 
 	script_push_bytes(&script, x_key_bytes, sizeof(x_key_bytes));
@@ -353,13 +376,18 @@ u8 *scriptpubkey_p2tr(const tal_t *ctx, const struct pubkey *inner_pubkey)
 
 	add_op(&script, OP_1);
 
-	secp256k1_ec_pubkey_serialize(secp256k1_ctx, key_bytes, &out_len, &inner_pubkey->pubkey, SECP256K1_EC_COMPRESSED);
+	secp256k1_ec_pubkey_serialize(secp256k1_ctx, key_bytes, &out_len,
+				      &inner_pubkey->pubkey,
+				      SECP256K1_EC_COMPRESSED);
 	/* Only commit to inner pubkey in tweak */
-	if (wally_ec_public_key_bip341_tweak(key_bytes, 33, /* merkle_root*/ NULL, 0, 0 /* flags */, tweaked_key_bytes, sizeof(tweaked_key_bytes)) != WALLY_OK)
+	if (wally_ec_public_key_bip341_tweak(
+		key_bytes, 33, /* merkle_root*/ NULL, 0, 0 /* flags */,
+		tweaked_key_bytes, sizeof(tweaked_key_bytes)) != WALLY_OK)
 		abort();
 
 	/* Cut off the first byte from the serialized compressed key */
-	script_push_bytes(&script, tweaked_key_bytes + 1, sizeof(tweaked_key_bytes) - 1);
+	script_push_bytes(&script, tweaked_key_bytes + 1,
+			  sizeof(tweaked_key_bytes) - 1);
 	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2TR_LEN);
 	return script;
 }
@@ -371,6 +399,43 @@ u8 *scriptpubkey_p2tr_derkey(const tal_t *ctx, const u8 inner_der[33])
 		abort();
 	}
 	return scriptpubkey_p2tr(ctx, &tr_key);
+}
+
+int pubkey_parity(const struct pubkey *pubkey)
+{
+	int ok, pk_parity;
+	secp256k1_xonly_pubkey x_key;
+
+	ok = secp256k1_xonly_pubkey_from_pubkey(secp256k1_ctx, &x_key,
+						&pk_parity, &(pubkey->pubkey));
+	assert(ok);
+
+	return pk_parity;
+}
+
+/* Create an output script for a taproot output */
+u8 *scriptpubkey_p2tr(const tal_t *ctx, const struct pubkey *pubkey)
+{
+	int ok;
+	secp256k1_xonly_pubkey x_key;
+	unsigned char x_key_bytes[32];
+	// struct sha256 h;
+	u8 *script = tal_arr(ctx, u8, 0);
+
+	add_op(&script, OP_1);
+
+	ok = secp256k1_xonly_pubkey_from_pubkey(secp256k1_ctx, &x_key,
+						/* pk_parity */ NULL,
+						&(pubkey->pubkey));
+	assert(ok);
+
+	ok = secp256k1_xonly_pubkey_serialize(secp256k1_ctx, x_key_bytes,
+					      &x_key);
+	assert(ok);
+
+	script_push_bytes(&script, x_key_bytes, sizeof(x_key_bytes));
+	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2TR_LEN);
+	return script;
 }
 
 /* BOLT #3:
@@ -389,7 +454,8 @@ u8 *scriptpubkey_p2tr_derkey(const tal_t *ctx, const u8 inner_der[33])
  * of the `initiator` ensures the `leasor` funds are not
  * spendable until the lease expires.
  *
- * <remote_pubkey> OP_CHECKSIGVERIFY MAX(1, lease_end - blockheight) OP_CHECKSEQUENCEVERIFY
+ * <remote_pubkey> OP_CHECKSIGVERIFY MAX(1, lease_end - blockheight)
+ * OP_CHECKSEQUENCEVERIFY
  */
 
 u8 *bitcoin_wscript_to_remote_anchored(const tal_t *ctx,
@@ -402,7 +468,8 @@ u8 *bitcoin_wscript_to_remote_anchored(const tal_t *ctx,
 	add_number(&script, csv_lock);
 	add_op(&script, OP_CHECKSEQUENCEVERIFY);
 
-	assert(is_to_remote_anchored_witness_script(script, tal_bytelen(script)));
+	assert(
+	    is_to_remote_anchored_witness_script(script, tal_bytelen(script)));
 	return script;
 }
 
@@ -431,8 +498,7 @@ bool is_to_remote_anchored_witness_script(const u8 *script, size_t script_len)
 u8 **bitcoin_witness_2of2(const tal_t *ctx,
 			  const struct bitcoin_signature *sig1,
 			  const struct bitcoin_signature *sig2,
-			  const struct pubkey *key1,
-			  const struct pubkey *key2)
+			  const struct pubkey *key1, const struct pubkey *key2)
 {
 	u8 **witness = tal_arr(ctx, u8 *, 4);
 
@@ -493,7 +559,7 @@ bool is_p2pkh(const u8 *script, struct bitcoin_address *addr)
 	if (script[24] != OP_CHECKSIG)
 		return false;
 	if (addr)
-		memcpy(addr, script+3, 20);
+		memcpy(addr, script + 3, 20);
 	return true;
 }
 
@@ -510,7 +576,7 @@ bool is_p2sh(const u8 *script, struct ripemd160 *addr)
 	if (script[22] != OP_EQUAL)
 		return false;
 	if (addr)
-		memcpy(addr, script+2, 20);
+		memcpy(addr, script + 2, 20);
 	return true;
 }
 
@@ -525,7 +591,7 @@ bool is_p2wsh(const u8 *script, struct sha256 *addr)
 	if (script[1] != OP_PUSHBYTES(sizeof(struct sha256)))
 		return false;
 	if (addr)
-		memcpy(addr, script+2, sizeof(struct sha256));
+		memcpy(addr, script + 2, sizeof(struct sha256));
 	return true;
 }
 
@@ -540,7 +606,7 @@ bool is_p2wpkh(const u8 *script, struct bitcoin_address *addr)
 	if (script[1] != OP_PUSHBYTES(sizeof(struct ripemd160)))
 		return false;
 	if (addr)
-		memcpy(addr, script+2, sizeof(*addr));
+		memcpy(addr, script + 2, sizeof(*addr));
 	return true;
 }
 
@@ -560,17 +626,28 @@ bool is_p2tr(const u8 *script, u8 xonly_pubkey[32])
 	return true;
 }
 
+bool is_ephemeral_anchor(const u8 *script)
+{
+	size_t script_len = tal_count(script);
+
+	if (script_len != 1)
+		return false;
+	if (script[0] != OP_1)
+		return false;
+	return true;
+}
+
 bool is_known_scripttype(const u8 *script)
 {
-	return is_p2wpkh(script, NULL) || is_p2wsh(script, NULL)
-		|| is_p2sh(script, NULL) || is_p2pkh(script, NULL)
-		|| is_p2tr(script, NULL);
+	return is_p2wpkh(script, NULL) || is_p2wsh(script, NULL) ||
+	       is_p2sh(script, NULL) || is_p2pkh(script, NULL) ||
+	       is_p2tr(script, NULL);
 }
 
 bool is_known_segwit_scripttype(const u8 *script)
 {
-	return is_p2wpkh(script, NULL) || is_p2wsh(script, NULL)
-		|| is_p2tr(script, NULL);
+	return is_p2wpkh(script, NULL) || is_p2wsh(script, NULL) ||
+	       is_p2tr(script, NULL);
 }
 
 u8 **bitcoin_witness_sig_and_element(const tal_t *ctx,
@@ -587,12 +664,52 @@ u8 **bitcoin_witness_sig_and_element(const tal_t *ctx,
 	return witness;
 }
 
+u8 **bitcoin_witness_bip340sig_and_element(const tal_t *ctx,
+					   const struct bip340sig *sig,
+					   const void *elem, size_t elemsize,
+					   const u8 *tapscript,
+					   const u8 *control_block)
+{
+	/* Itms ordered as a stack for readability */
+	if (elem) {
+		/*
+		 *
+		 *    The recipient node can redeem the HTLC with the witness:
+		 *
+		 *        <payment_preimage>
+		 * <recipient_settlement_pubkey_signature>
+		 *
+		 */
+		u8 **witness = tal_arr(ctx, u8 *, 4);
+
+		witness[3] = tal_dup_talarr(witness, u8, control_block);
+		witness[2] = tal_dup_talarr(witness, u8, tapscript);
+		witness[1] = stack_bip340sig(witness, sig, SIGHASH_DEFAULT);
+		witness[0] = tal_dup_arr(witness, u8, elem, elemsize, 0);
+
+		return witness;
+	} else {
+		/*
+		 *    And the offerer via:
+		 *
+		 *        <offerer_settlement_pubkey_signature>
+		 */
+		u8 **witness = tal_arr(ctx, u8 *, 3);
+
+		witness[2] = tal_dup_talarr(witness, u8, control_block);
+		witness[1] = tal_dup_talarr(witness, u8, tapscript);
+		witness[0] = stack_bip340sig(witness, sig, SIGHASH_DEFAULT);
+
+		return witness;
+	}
+}
+
 /* BOLT #3:
  *
  * This output sends funds back to the owner of this commitment transaction and
- * thus must be timelocked using `OP_CHECKSEQUENCEVERIFY`. It can be claimed, without delay,
- * by the other party if they know the revocation private key. The output is a
- * version-0 P2WSH, with a witness script:
+ * thus must be timelocked using `OP_CHECKSEQUENCEVERIFY`. It can be claimed,
+ * without delay, by the other party if they know the revocation private key.
+ * The output is a version-0 P2WSH, with a witness script:
  *
  *     OP_IF
  *         # Penalty transaction
@@ -720,8 +837,8 @@ u8 *bitcoin_wscript_htlc_offer_ripemd160(const tal_t *ctx,
 	add_op(&script, OP_CHECKMULTISIG);
 	add_op(&script, OP_ELSE);
 	add_op(&script, OP_HASH160);
-	script_push_bytes(&script,
-			  payment_ripemd->u.u8, sizeof(payment_ripemd->u.u8));
+	script_push_bytes(&script, payment_ripemd->u.u8,
+			  sizeof(payment_ripemd->u.u8));
 	add_op(&script, OP_EQUALVERIFY);
 	add_op(&script, OP_CHECKSIG);
 	add_op(&script, OP_ENDIF);
@@ -746,11 +863,9 @@ u8 *bitcoin_wscript_htlc_offer(const tal_t *ctx,
 	struct ripemd160 ripemd;
 
 	ripemd160(&ripemd, payment_hash->u.u8, sizeof(payment_hash->u));
-	return bitcoin_wscript_htlc_offer_ripemd160(ctx, localhtlckey,
-						    remotehtlckey,
-						    &ripemd, revocationkey,
-						    option_anchor_outputs,
-						    option_anchors_zero_fee_htlc_tx);
+	return bitcoin_wscript_htlc_offer_ripemd160(
+	    ctx, localhtlckey, remotehtlckey, &ripemd, revocationkey,
+	    option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
 }
 
 /* BOLT #3:
@@ -800,14 +915,11 @@ u8 *bitcoin_wscript_htlc_offer(const tal_t *ctx,
  *      1 OP_CHECKSEQUENCEVERIFY OP_DROP
  *  OP_ENDIF
  */
-u8 *bitcoin_wscript_htlc_receive_ripemd(const tal_t *ctx,
-					const struct abs_locktime *htlc_abstimeout,
-					const struct pubkey *localhtlckey,
-					const struct pubkey *remotehtlckey,
-					const struct ripemd160 *payment_ripemd,
-					const struct pubkey *revocationkey,
-					bool option_anchor_outputs,
-					bool option_anchors_zero_fee_htlc_tx)
+u8 *bitcoin_wscript_htlc_receive_ripemd(
+    const tal_t *ctx, const struct abs_locktime *htlc_abstimeout,
+    const struct pubkey *localhtlckey, const struct pubkey *remotehtlckey,
+    const struct ripemd160 *payment_ripemd, const struct pubkey *revocationkey,
+    bool option_anchor_outputs, bool option_anchors_zero_fee_htlc_tx)
 {
 	u8 *script = tal_arr(ctx, u8, 0);
 	struct ripemd160 ripemd;
@@ -827,8 +939,8 @@ u8 *bitcoin_wscript_htlc_receive_ripemd(const tal_t *ctx,
 	add_op(&script, OP_EQUAL);
 	add_op(&script, OP_IF);
 	add_op(&script, OP_HASH160);
-	script_push_bytes(&script,
-			  payment_ripemd->u.u8, sizeof(payment_ripemd->u.u8));
+	script_push_bytes(&script, payment_ripemd->u.u8,
+			  sizeof(payment_ripemd->u.u8));
 	add_op(&script, OP_EQUALVERIFY);
 	add_number(&script, 2);
 	add_op(&script, OP_SWAP);
@@ -852,23 +964,19 @@ u8 *bitcoin_wscript_htlc_receive_ripemd(const tal_t *ctx,
 	return script;
 }
 
-u8 *bitcoin_wscript_htlc_receive(const tal_t *ctx,
-				 const struct abs_locktime *htlc_abstimeout,
-				 const struct pubkey *localhtlckey,
-				 const struct pubkey *remotehtlckey,
-				 const struct sha256 *payment_hash,
-				 const struct pubkey *revocationkey,
-				 bool option_anchor_outputs,
-				 bool option_anchors_zero_fee_htlc_tx)
+u8 *bitcoin_wscript_htlc_receive(
+    const tal_t *ctx, const struct abs_locktime *htlc_abstimeout,
+    const struct pubkey *localhtlckey, const struct pubkey *remotehtlckey,
+    const struct sha256 *payment_hash, const struct pubkey *revocationkey,
+    bool option_anchor_outputs, bool option_anchors_zero_fee_htlc_tx)
 {
 	struct ripemd160 ripemd;
 
 	ripemd160(&ripemd, payment_hash->u.u8, sizeof(payment_hash->u));
-	return bitcoin_wscript_htlc_receive_ripemd(ctx, htlc_abstimeout,
-						   localhtlckey, remotehtlckey,
-						   &ripemd, revocationkey,
-						   option_anchor_outputs,
-						   option_anchors_zero_fee_htlc_tx);
+	return bitcoin_wscript_htlc_receive_ripemd(
+	    ctx, htlc_abstimeout, localhtlckey, remotehtlckey, &ripemd,
+	    revocationkey, option_anchor_outputs,
+	    option_anchors_zero_fee_htlc_tx);
 }
 
 /* BOLT #3:
@@ -876,12 +984,13 @@ u8 *bitcoin_wscript_htlc_receive(const tal_t *ctx,
  * ## HTLC-Timeout and HTLC-Success Transactions
  *
  *...
- *   * `txin[0]` witness stack: `0 <remotehtlcsig> <localhtlcsig>  <payment_preimage>` for HTLC-success, `0 <remotehtlcsig> <localhtlcsig> <>` for HTLC-timeout
+ *   * `txin[0]` witness stack: `0 <remotehtlcsig> <localhtlcsig>
+ *<payment_preimage>` for HTLC-success, `0 <remotehtlcsig> <localhtlcsig> <>`
+ *for HTLC-timeout
  */
-u8 **bitcoin_witness_htlc_timeout_tx(const tal_t *ctx,
-				     const struct bitcoin_signature *localhtlcsig,
-				     const struct bitcoin_signature *remotehtlcsig,
-				     const u8 *wscript)
+u8 **bitcoin_witness_htlc_timeout_tx(
+    const tal_t *ctx, const struct bitcoin_signature *localhtlcsig,
+    const struct bitcoin_signature *remotehtlcsig, const u8 *wscript)
 {
 	u8 **witness = tal_arr(ctx, u8 *, 5);
 
@@ -894,11 +1003,10 @@ u8 **bitcoin_witness_htlc_timeout_tx(const tal_t *ctx,
 	return witness;
 }
 
-u8 **bitcoin_witness_htlc_success_tx(const tal_t *ctx,
-				     const struct bitcoin_signature *localhtlcsig,
-				     const struct bitcoin_signature *remotesig,
-				     const struct preimage *preimage,
-				     const u8 *wscript)
+u8 **bitcoin_witness_htlc_success_tx(
+    const tal_t *ctx, const struct bitcoin_signature *localhtlcsig,
+    const struct bitcoin_signature *remotesig, const struct preimage *preimage,
+    const u8 *wscript)
 {
 	u8 **witness = tal_arr(ctx, u8 *, 5);
 
@@ -910,8 +1018,7 @@ u8 **bitcoin_witness_htlc_success_tx(const tal_t *ctx,
 
 	return witness;
 }
-u8 *bitcoin_wscript_htlc_tx(const tal_t *ctx,
-			    u16 to_self_delay,
+u8 *bitcoin_wscript_htlc_tx(const tal_t *ctx, u16 to_self_delay,
 			    const struct pubkey *revocation_pubkey,
 			    const struct pubkey *local_delayedkey)
 {
@@ -1001,4 +1108,303 @@ bool scripteq(const u8 *s1, const u8 *s2)
 	if (tal_count(s1) == 0)
 		return true;
 	return memcmp(s1, s2, tal_count(s1)) == 0;
+}
+
+u8 *bitcoin_spk_ephemeral_anchor(const tal_t *ctx)
+{
+	u8 *script = tal_arr(ctx, u8, 0);
+
+	/* BOLT #3:
+	 * FIXME cite the extension bolts
+	 */
+	add_op(&script, OP_TRUE);
+	return script;
+}
+
+void compute_taptree_merkle_root(struct sha256 *hash_out, u8 **scripts,
+				 size_t num_scripts)
+{
+	int ok;
+	unsigned char leaf_version = 0xc0;
+	unsigned char
+	    tag_hash_buf[1000]; /* Needs to be large enough for HTLC scripts */
+	unsigned char tap_hashes[64]; /* To store the leaves for comparison */
+
+	/* Only what's required for eltoo et al for now, sue me */
+	assert(num_scripts == 1 || num_scripts == 2);
+	if (num_scripts == 1) {
+		size_t script_len = tal_count(scripts[0]);
+		unsigned char *p = tag_hash_buf;
+		/* Let k0 = hashTapLeaf(v || compact_size(size of s) || s); also
+		 * call it the tapleaf hash. */
+		p[0] = leaf_version;
+		p++;
+		p += varint_put(p, script_len);
+		memcpy(p, scripts[0], script_len);
+		p += script_len;
+
+		/* k0 == km, this is the merkle root so we directly write it out
+		 */
+		ok = wally_tagged_hash(tag_hash_buf, p - tag_hash_buf,
+				       "TapLeaf", hash_out->u.u8);
+		assert(ok == WALLY_OK);
+	} else if (num_scripts == 2) {
+		/* First script */
+		size_t script_len = tal_count(scripts[0]);
+		unsigned char *p = tag_hash_buf;
+		/* Let k0 = hashTapLeaf(v || compact_size(size of s) || s); also
+		 * call it the tapleaf hash. */
+		p[0] = leaf_version;
+		p++;
+		p += varint_put(p, script_len);
+		memcpy(p, scripts[0], script_len);
+		p += script_len;
+
+		ok = wally_tagged_hash(tag_hash_buf, p - tag_hash_buf,
+				       "TapLeaf", tap_hashes);
+		assert(ok == WALLY_OK);
+
+		/* Second script */
+		script_len = tal_count(scripts[1]);
+		p = tag_hash_buf;
+		/* Let k0 = hashTapLeaf(v || compact_size(size of s) || s); also
+		 * call it the tapleaf hash. */
+		p[0] = leaf_version;
+		p++;
+		p += varint_put(p, script_len);
+		memcpy(p, scripts[1], script_len);
+		p += script_len;
+
+		ok = wally_tagged_hash(tag_hash_buf, p - tag_hash_buf,
+				       "TapLeaf", tap_hashes + 32);
+		assert(ok == WALLY_OK);
+
+		/* If kj ≥ ej: kj+1 = hashTapBranch(ej || kj), swap them*/
+		if (memcmp(tap_hashes, tap_hashes + 32, 32) >= 0) {
+			memcpy(tag_hash_buf, tap_hashes, 32);
+			memcpy(tap_hashes, tap_hashes + 32, 32);
+			memcpy(tap_hashes + 32, tag_hash_buf, 32);
+		}
+		ok = wally_tagged_hash(tap_hashes, sizeof(tap_hashes),
+				       "TapBranch", hash_out->u.u8);
+		assert(ok == WALLY_OK);
+	}
+}
+
+void compute_taptree_merkle_root_with_hint(struct sha256 *update_merkle_root,
+					   const u8 *update_tapscript,
+					   const u8 *invalidated_annex_hint)
+{
+	int ok;
+	unsigned char leaf_version = 0xc0;
+	unsigned char
+	    tag_hash_buf[1000]; /* Needs to be large enough for HTLC scripts */
+	unsigned char tap_hashes[64]; /* To store the leaves for comparison */
+
+	size_t script_len = tal_count(update_tapscript);
+	unsigned char *p = tag_hash_buf;
+
+	assert(tal_count(invalidated_annex_hint) == 34 &&
+	       invalidated_annex_hint[0] == 0x50);
+
+	/* Let k0 = hashTapLeaf(v || compact_size(size of s) || s); also call it
+	 * the tapleaf hash. */
+	p[0] = leaf_version;
+	p++;
+	p += varint_put(p, script_len);
+	memcpy(p, update_tapscript, script_len);
+	p += script_len;
+
+	ok = wally_tagged_hash(tag_hash_buf, p - tag_hash_buf, "TapLeaf",
+			       tap_hashes);
+	assert(ok == WALLY_OK);
+
+	/* Put invalidated hint in place as a tapleaf hash directly */
+	memcpy(tap_hashes + 32, invalidated_annex_hint + 2, 32);
+
+	/* If kj ≥ ej: kj+1 = hashTapBranch(ej || kj), swap them*/
+	if (memcmp(tap_hashes, tap_hashes + 32, 32) >= 0) {
+		memcpy(tag_hash_buf, tap_hashes, 32);
+		memcpy(tap_hashes, tap_hashes + 32, 32);
+		memcpy(tap_hashes + 32, tag_hash_buf, 32);
+	}
+	ok = wally_tagged_hash(tap_hashes, sizeof(tap_hashes), "TapBranch",
+			       update_merkle_root->u.u8);
+	assert(ok == WALLY_OK);
+}
+
+u8 *compute_control_block(const tal_t *ctx, const u8 *other_script,
+			  const u8 *annex_hint,
+			  const struct pubkey *inner_pubkey, int parity_bit)
+{
+	int ok;
+	u8 *control_block_cursor;
+	u8 *control_block =
+	    tal_arr(ctx, u8, (other_script || annex_hint) ? 33 + 32 : 33);
+	secp256k1_xonly_pubkey xonly_inner_pubkey;
+
+	ok = secp256k1_xonly_pubkey_from_pubkey(
+	    secp256k1_ctx, &xonly_inner_pubkey,
+	    NULL /* pk_parity (this is parity bit from inner key, do not want */
+	    ,
+	    &inner_pubkey->pubkey);
+
+	assert(ok);
+
+	/* other_script and annex_hint are mutually exclusive args */
+	assert(!(other_script && annex_hint));
+
+	control_block_cursor = control_block;
+
+	unsigned char leaf_version = 0xc0;
+	unsigned char
+	    tag_hash_buf[1000]; /* Needs to be large enough for HTLC scripts */
+
+	/* Only what's required for eltoo et al for now, 2 leaves max, sue me */
+
+	assert(parity_bit == 0 || parity_bit == 1);
+	control_block_cursor[0] = leaf_version | parity_bit;
+	control_block_cursor++;
+
+	ok = secp256k1_xonly_pubkey_serialize(
+	    secp256k1_ctx, control_block_cursor, &xonly_inner_pubkey);
+	assert(ok);
+	control_block_cursor += 32;
+
+	/* Need tapleaf hash of the other script of the 2 */
+	if (other_script) {
+		size_t script_len = tal_count(other_script);
+		unsigned char *p = tag_hash_buf;
+		/* Let k0 = hashTapLeaf(v || compact_size(size of s) || s); also
+		 * call it the tapleaf hash. */
+		p[0] = leaf_version;
+		p++;
+		p += varint_put(p, script_len);
+		memcpy(p, other_script, script_len);
+		p += script_len;
+
+		ok = wally_tagged_hash(tag_hash_buf, p - tag_hash_buf,
+				       "TapLeaf", control_block_cursor);
+		assert(ok == WALLY_OK);
+		control_block_cursor += 32;
+	} else if (annex_hint) {
+		assert(tal_count(annex_hint) == 34);
+		assert(annex_hint[0] == 0x50);
+		assert(annex_hint[1] == 32);
+		memcpy(control_block_cursor, annex_hint + 2, 32);
+		control_block_cursor += 32;
+	}
+	return control_block;
+}
+
+u8 *make_eltoo_settle_script(const tal_t *ctx,
+			     const struct bitcoin_tx *settle_tx,
+			     size_t input_index)
+{
+	int ok;
+	enum sighash_type sh_type = SIGHASH_ANYPREVOUTANYSCRIPT | SIGHASH_ALL;
+	u8 *script = tal_arr(ctx, u8, 0);
+	struct sha256_double sighash;
+	struct bip340sig sig;
+	unsigned char sig_with_flag[65];
+	secp256k1_keypair G_pair;
+	secp256k1_xonly_pubkey G;
+	struct privkey g;
+	unsigned char one_G_bytes[33];
+
+	/* We use tapleaf_script as a switch for doing BIP342 hash
+	 * We really shouldn't, but for now we pass in dummy
+	 * since APOAS sighash doesn't cover it anyways.
+	 */
+	bitcoin_tx_taproot_hash_for_sig(settle_tx, input_index, sh_type, script,
+					/* annex */ NULL, &sighash);
+
+	/* Should directly take keypair instead of extracting but... */
+	create_keypair_of_one(&G_pair);
+	ok = secp256k1_keypair_sec(secp256k1_ctx, g.secret.data, &G_pair);
+	assert(ok);
+
+	bip340_sign_hash(&g, &sighash, &sig);
+
+	/* 0x01-prefixed G for APOAS pubkey */
+	ok = secp256k1_keypair_xonly_pub(secp256k1_ctx, &G,
+					 /* pk_parity */ NULL, &G_pair);
+	assert(ok);
+	one_G_bytes[0] = 0x01;
+	ok = secp256k1_xonly_pubkey_serialize(secp256k1_ctx, one_G_bytes + 1,
+					      &G);
+
+	memcpy(sig_with_flag, sig.u8, sizeof(sig.u8));
+	sig_with_flag[64] = sh_type;
+
+	/* Build the script */
+	script_push_bytes(&script, sig_with_flag, sizeof(sig_with_flag));
+	script_push_bytes(&script, one_G_bytes, sizeof(one_G_bytes));
+	add_op(&script, OP_CHECKSIG);
+	return script;
+}
+
+u8 *make_eltoo_update_script(const tal_t *ctx, u32 update_num)
+{
+	/* TL(n) = `500000000+o+n`
+	 * where EXPR_UPDATE(n) =
+	 *
+	 *`<1> OP_CHECKSIGVERIFY <TL(n)> OP_CHECKLOCKTIMEVERIFY` if `n > 0`
+	 */
+	u8 *script = tal_arr(ctx, u8, 0);
+	add_op(&script, OP_1);
+	add_op(&script, OP_CHECKSIGVERIFY);
+	add_number(&script, 500000000 + update_num);
+	add_op(&script, OP_CHECKLOCKTIMEVERIFY);
+	return script;
+}
+
+u8 *make_eltoo_funding_update_script(const tal_t *ctx)
+{
+	/* where EXPR_UPDATE(n) =
+	 *
+	 *`<1> OP_CHECKSIG`, in the case of `n == 0`
+	 */
+	u8 *script = tal_arr(ctx, u8, 0);
+	add_op(&script, OP_1);
+	add_op(&script, OP_CHECKSIG);
+	return script;
+}
+
+u8 *make_eltoo_htlc_success_script(const tal_t *ctx,
+				   const struct pubkey *settlement_pubkey,
+				   const struct ripemd160 *invoice_hash)
+{
+	/* where EXPR_SUCCESS =
+	 *
+	 * `<settlement_pubkey> OP_CHECKSIGVERIFY OP_SIZE <20> OP_EQUALVERIFY
+    OP_HASH160 <H> OP_EQUAL`
+	 */
+	u8 *script = tal_arr(ctx, u8, 0);
+	add_push_xonly_key(&script, settlement_pubkey);
+	add_op(&script, OP_CHECKSIGVERIFY);
+	add_op(&script, OP_SIZE);
+	add_number(&script, 32);
+	add_op(&script, OP_EQUALVERIFY);
+	add_op(&script, OP_HASH160);
+	script_push_bytes(&script, invoice_hash->u.u8,
+			  sizeof(invoice_hash->u.u8));
+	add_op(&script, OP_EQUAL);
+	return script;
+}
+
+u8 *make_eltoo_htlc_timeout_script(const tal_t *ctx,
+				   const struct pubkey *settlement_pubkey,
+				   u32 htlc_timeout)
+{
+	/* and EXPR_TIMEOUT =
+	 *
+	 * `<settlement_pubkey> OP_CHECKSIGVERIFY N OP_CHECKLOCKTIMEVERIFY`
+	 */
+	u8 *script = tal_arr(ctx, u8, 0);
+	add_push_xonly_key(&script, settlement_pubkey);
+	add_op(&script, OP_CHECKSIGVERIFY);
+	add_number(&script, htlc_timeout);
+	add_op(&script, OP_CHECKLOCKTIMEVERIFY);
+	return script;
 }

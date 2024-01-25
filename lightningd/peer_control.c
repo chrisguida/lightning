@@ -28,6 +28,7 @@
 #include <common/status.h>
 #include <common/timeout.h>
 #include <common/type_to_string.h>
+#include <common/update_tx.h>
 #include <common/utils.h>
 #include <common/version.h>
 #include <common/wire_error.h>
@@ -86,13 +87,12 @@ void peer_set_dbid(struct peer *peer, u64 dbid)
 	peer_dbid_map_add(peer->ld->peers_by_dbid, peer);
 }
 
-struct peer *new_peer(struct lightningd *ld, u64 dbid,
-		      const struct node_id *id,
+struct peer *new_peer(struct lightningd *ld, u64 dbid, const struct node_id *id,
 		      const struct wireaddr_internal *addr,
-		      const u8 *their_features,
-		      bool connected_incoming)
+		      const u8 *their_features, bool connected_incoming)
 {
-	/* We are owned by our channels, and freed manually by destroy_channel */
+	/* We are owned by our channels, and freed manually by destroy_channel
+	 */
 	struct peer *peer = tal(NULL, struct peer);
 
 	peer->ld = ld;
@@ -105,8 +105,8 @@ struct peer *new_peer(struct lightningd *ld, u64 dbid,
 	list_head_init(&peer->channels);
 	peer->direction = node_id_idx(&peer->ld->id, &peer->id);
 	peer->connected = PEER_DISCONNECTED;
-	peer->last_connect_attempt.ts.tv_sec
-		= peer->last_connect_attempt.ts.tv_nsec = 0;
+	peer->last_connect_attempt.ts.tv_sec =
+	    peer->last_connect_attempt.ts.tv_nsec = 0;
 	if (their_features)
 		peer->their_features = tal_dup_talarr(peer, u8, their_features);
 	else
@@ -140,7 +140,8 @@ void maybe_delete_peer(struct peer *peer)
 	if (peer->uncommitted_channel) {
 		/* This isn't sufficient to keep it in db! */
 		if (peer->dbid != 0) {
-			wallet_delete_peer_if_unused(peer->ld->wallet, peer->dbid);
+			wallet_delete_peer_if_unused(peer->ld->wallet,
+						     peer->dbid);
 			peer_dbid_map_del(peer->ld->peers_by_dbid, peer);
 			peer->dbid = 0;
 		}
@@ -164,8 +165,7 @@ static void peer_channels_cleanup(struct lightningd *ld,
 
 	/* Freeing channels can free peer, so gather first. */
 	channels = tal_arr(tmpctx, struct channel *, 0);
-	list_for_each(&peer->channels, c, list)
-		tal_arr_expand(&channels, c);
+	list_for_each(&peer->channels, c, list) tal_arr_expand(&channels, c);
 
 	if (peer->uncommitted_channel) {
 		/* Frees peer if no channels */
@@ -196,8 +196,7 @@ struct peer *peer_by_id(struct lightningd *ld, const struct node_id *id)
 	return peer_node_id_map_get(ld->peers, id);
 }
 
-struct peer *peer_from_json(struct lightningd *ld,
-			    const char *buffer,
+struct peer *peer_from_json(struct lightningd *ld, const char *buffer,
 			    const jsmntok_t *peeridtok)
 {
 	struct node_id peerid;
@@ -238,23 +237,18 @@ static struct bitcoin_tx *sign_last_tx(const tal_t *ctx,
 	struct bitcoin_tx *tx = clone_bitcoin_tx(ctx, last_tx);
 
 	assert(!tx->wtx->inputs[0].witness);
-	msg = towire_hsmd_sign_commitment_tx(NULL,
-					     &channel->peer->id,
-					     channel->dbid,
-					     tx,
-					     &channel->channel_info
-					     .remote_fundingkey,
-					     commit_index);
+	msg = towire_hsmd_sign_commitment_tx(
+	    NULL, &channel->peer->id, channel->dbid, tx,
+	    &channel->channel_info.remote_fundingkey, commit_index);
 
 	msg = hsm_sync_req(tmpctx, ld, take(msg));
 	if (!fromwire_hsmd_sign_commitment_tx_reply(msg, &sig))
 		fatal("HSM gave bad sign_commitment_tx_reply %s",
 		      tal_hex(tmpctx, msg));
 
-	witness =
-	    bitcoin_witness_2of2(tx, last_sig,
-				 &sig, &channel->channel_info.remote_fundingkey,
-				 &channel->local_funding_pubkey);
+	witness = bitcoin_witness_2of2(tx, last_sig, &sig,
+				       &channel->channel_info.remote_fundingkey,
+				       &channel->local_funding_pubkey);
 
 	bitcoin_tx_input_set_witness(tx, 0, take(witness));
 	return tx;
@@ -272,50 +266,74 @@ bool invalid_last_tx(const struct bitcoin_tx *tx)
 #endif
 }
 
-static bool commit_tx_send_finished(struct channel *channel,
-				    const struct bitcoin_tx *tx,
-				    bool success,
-				    const char *err,
-				    struct anchor_details *adet)
+static void eltoo_finalize_and_send_last(struct lightningd *ld,
+					 struct channel *channel)
 {
+	struct bitcoin_tx **bound_update_and_settle_txs;
 	struct bitcoin_txid txid;
 
-	bitcoin_txid(tx, &txid);
+	/* Eltoo keyset should probably have all pubkeys... */
+	bound_update_and_settle_txs = bind_txs_to_funding_outpoint(
+	    channel->eltoo_keyset.complete_update_tx, &channel->funding,
+	    channel->eltoo_keyset.complete_settle_tx,
+	    &channel->eltoo_keyset.last_complete_state.self_psig,
+	    &channel->eltoo_keyset.last_complete_state.other_psig,
+	    &channel->local_funding_pubkey,
+	    &channel->channel_info.remote_fundingkey,
+	    &channel->eltoo_keyset.last_complete_state.session);
 
-	/* If it's already mined, stop retransmitting, stop boosting. */
-	if (wallet_transaction_height(channel->peer->ld->wallet, &txid) != 0) {
-		tal_free(adet);
-		return true;
-	}
+	/* N.B. txid instability possible with eltoo, need to handle? */
+	bitcoin_txid(bound_update_and_settle_txs[0], &txid);
 
-	/* Boost (if possible), and keep trying! */
-	commit_tx_boost(channel, adet, success);
-	return false;
-}
-
-static struct bitcoin_tx *sign_and_send_last(const tal_t *ctx,
-					     struct lightningd *ld,
-					     struct channel *channel,
-					     const char *cmd_id,
-					     const struct bitcoin_tx *last_tx,
-					     const struct bitcoin_signature *last_sig)
-{
-	struct bitcoin_txid txid;
-	struct anchor_details *adet;
-	struct bitcoin_tx *tx;
-
-	tx = sign_last_tx(ctx, channel, last_tx, last_sig);
-	bitcoin_txid(tx, &txid);
-	wallet_transaction_add(ld->wallet, tx->wtx, 0, 0);
-	wallet_extract_owned_outputs(ld->wallet, tx->wtx, false, NULL, NULL);
-
-	/* Remember anchor information for commit_tx_boost */
-	adet = create_anchor_details(NULL, channel, tx);
+	wallet_transaction_add(ld->wallet, bound_update_and_settle_txs[0]->wtx,
+			       0, 0);
+	wallet_transaction_annotate(
+	    ld->wallet, &txid,
+	    TX_CHANNEL_UNILATERAL /* FIXME What should this be anyways? */,
+	    channel->dbid);
 
 	/* Keep broadcasting until we say stop (can fail due to dup,
 	 * if they beat us to the broadcast). */
-	broadcast_tx(channel, ld->topology, channel, tx, cmd_id, false, 0,
-		     commit_tx_send_finished, NULL, take(adet));
+	/* FIXME We need to add fees via anchor */
+	broadcast_tx(ld->topology, channel, bound_update_and_settle_txs[0],
+		     NULL);
+
+	/* FIXME maybe the roundtrip isn't needed... just rely on this
+	 * subroutine */
+	remove_sig(bound_update_and_settle_txs[0]);
+
+	assert(ld);
+}
+
+static void eltoo_finalize_and_send_last(struct lightningd *ld,
+					 struct channel *channel)
+{
+	struct bitcoin_tx **bound_update_and_settle_txs;
+	struct bitcoin_txid txid;
+
+	/* Eltoo keyset should probably have all pubkeys... */
+	bound_update_and_settle_txs = bind_txs_to_funding_outpoint(
+	    channel->eltoo_keyset.complete_update_tx, &channel->funding,
+	    channel->eltoo_keyset.complete_settle_tx,
+	    &channel->eltoo_keyset.last_complete_state.self_psig,
+	    &channel->eltoo_keyset.last_complete_state.other_psig,
+	    &channel->local_funding_pubkey,
+	    &channel->channel_info.remote_fundingkey,
+	    &channel->eltoo_keyset.last_complete_state.session);
+
+	/* N.B. txid instability possible with eltoo, need to handle? */
+	bitcoin_txid(bound_update_and_settle_txs[0], &txid);
+
+	wallet_transaction_add(ld->wallet, bound_update_and_settle_txs[0]->wtx,
+			       0, 0);
+	wallet_transaction_annotate(
+	    ld->wallet, &txid,
+	    TX_CHANNEL_UNILATERAL /* FIXME What should this be anyways? */,
+	    channel->dbid);
+
+	/* Keep broadcasting until we say stop (can fail due to dup,
+	 * if they beat us to the broadcast). */
+	broadcast_tx(ld->topology, channel, last_tx, NULL);
 
 	return tx;
 }
@@ -327,27 +345,50 @@ static enum watch_result funding_spent(struct channel *channel,
 				       const struct block *block);
 
 /* We coop-closed channel: if another inflight confirms, force close */
-static enum watch_result closed_inflight_depth_cb(struct lightningd *ld,
-						  const struct bitcoin_txid *txid,
-						  const struct bitcoin_tx *tx,
-						  unsigned int depth,
-						  struct channel_inflight *inflight)
+static enum watch_result
+closed_inflight_depth_cb(struct lightningd *ld, const struct bitcoin_txid *txid,
+			 const struct bitcoin_tx *tx, unsigned int depth,
+			 struct channel_inflight *inflight)
 {
 	if (depth == 0)
 		return KEEP_WATCHING;
 
 	/* This is now the main tx. */
 	update_channel_from_inflight(ld, inflight->channel, inflight);
-	channel_fail_permanent(inflight->channel,
-			       REASON_UNKNOWN,
-			       "Inflight tx %s confirmed after mutual close",
-			       type_to_string(tmpctx, struct bitcoin_txid, txid));
+	channel_fail_permanent(
+	    inflight->channel, REASON_UNKNOWN,
+	    "Inflight tx %s confirmed after mutual close",
+	    type_to_string(tmpctx, struct bitcoin_txid, txid));
 	return DELETE_WATCH;
+}
+
+void eltoo_drop_to_chain(struct lightningd *ld, struct channel *channel,
+			 bool cooperative)
+{
+	// Channel inflights aren't eltoo-aware... struct channel_inflight
+	// *inflight;
+
+	/* FIXME We need to drop *every* commitment transaction to chain
+	if (!cooperative && !list_empty(&channel->inflights)) {
+	    list_for_each(&channel->inflights, inflight, list)
+		sign_and_send_last(ld, channel,
+			   inflight->last_tx,
+			   &inflight->last_sig);
+	} else
+	*/
+	/* FIXME figure out interface */
+	eltoo_finalize_and_send_last(ld, channel);
+
+	resolve_close_command(ld, channel, cooperative);
 }
 
 void drop_to_chain(struct lightningd *ld, struct channel *channel,
 		   bool cooperative)
 {
+	if (channel->our_config.is_eltoo) {
+		eltoo_drop_to_chain(ld, channel, cooperative);
+		return;
+	}
 	struct channel_inflight *inflight;
 	const char *cmd_id;
 
@@ -355,10 +396,9 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 	 * make sure we're watching for the funding spend */
 	if (!channel->funding_spend_watch) {
 		log_debug(channel->log, "Adding funding_spend_watch");
-		channel->funding_spend_watch = watch_txo(channel,
-							 ld->topology, channel,
-							 &channel->funding,
-							 funding_spent);
+		channel->funding_spend_watch =
+		    watch_txo(channel, ld->topology, channel, &channel->funding,
+			      funding_spent);
 	}
 
 	/* If this was triggered by a close command, get a copy of the cmd id */
@@ -372,33 +412,32 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 	 *      - MUST NOT broadcast its commitment transaction.
 	 */
 	if (channel->future_per_commitment_point && !cooperative) {
-		log_broken(channel->log,
-			   "Cannot broadcast our commitment tx:"
-			   " they have a future one");
+		log_broken(channel->log, "Cannot broadcast our commitment tx:"
+					 " they have a future one");
 	} else if (channel_state_open_uncommitted(channel->state)) {
 		/* There's no commitment transaction, we can
 		 * safely forget this channel */
-		log_info(channel->log,
-			 "Initialized channel (v2) received error"
-			 ", we're deleting the channel");
+		log_info(channel->log, "Initialized channel (v2) received error"
+				       ", we're deleting the channel");
 	} else if (invalid_last_tx(channel->last_tx)) {
-		log_broken(channel->log,
-			   "Cannot broadcast our commitment tx:"
-			   " it's invalid! (ancient channel?)");
+		log_broken(channel->log, "Cannot broadcast our commitment tx:"
+					 " it's invalid! (ancient channel?)");
 	} else {
 		struct bitcoin_tx *tx COMPILER_WANTS_INIT("gcc 12.3.0");
 
 		/* We need to drop *every* commitment transaction to chain */
 		if (!cooperative && !list_empty(&channel->inflights)) {
-			list_for_each(&channel->inflights, inflight, list) {
+			list_for_each(&channel->inflights, inflight, list)
+			{
 				if (!inflight->last_tx)
 					continue;
-				tx = sign_and_send_last(tmpctx, ld, channel, cmd_id,
-							inflight->last_tx,
-							&inflight->last_sig);
+				tx = sign_and_send_last(
+				    tmpctx, ld, channel, cmd_id,
+				    inflight->last_tx, &inflight->last_sig);
 			}
 		} else
-			tx = sign_and_send_last(tmpctx, ld, channel, cmd_id, channel->last_tx,
+			tx = sign_and_send_last(tmpctx, ld, channel, cmd_id,
+						channel->last_tx,
 						&channel->last_sig);
 
 		resolve_close_command(ld, channel, cooperative, tx);
@@ -409,7 +448,8 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 	 * opening.  So, if we get any unexpected inflight confirming, we
 	 * force close. */
 	if (cooperative) {
-		list_for_each(&channel->inflights, inflight, list) {
+		list_for_each(&channel->inflights, inflight, list)
+		{
 			if (bitcoin_outpoint_eq(&inflight->funding->outpoint,
 						&channel->funding)) {
 				continue;
@@ -427,10 +467,10 @@ void resend_closing_transactions(struct lightningd *ld)
 	struct channel *channel;
 	struct peer_node_id_map_iter it;
 
-	for (peer = peer_node_id_map_first(ld->peers, &it);
-	     peer;
+	for (peer = peer_node_id_map_first(ld->peers, &it); peer;
 	     peer = peer_node_id_map_next(ld->peers, &it)) {
-		list_for_each(&peer->channels, channel, list) {
+		list_for_each(&peer->channels, channel, list)
+		{
 			switch (channel->state) {
 			case CHANNELD_AWAITING_LOCKIN:
 			case CHANNELD_NORMAL:
@@ -457,18 +497,16 @@ void resend_closing_transactions(struct lightningd *ld)
 	}
 }
 
-void channel_errmsg(struct channel *channel,
-		    struct peer_fd *peer_fd,
-		    const char *desc,
-		    const u8 *err_for_them,
-		    bool disconnect,
+void channel_errmsg(struct channel *channel, struct peer_fd *peer_fd,
+		    const char *desc, const u8 *err_for_them, bool disconnect,
 		    bool warning)
 {
 	/* Clean up any in-progress open attempts */
 	channel_cleanup_commands(channel, desc);
 
 	if (channel_state_uncommitted(channel->state)) {
-		log_info(channel->log, "%s", "Unsaved peer failed."
+		log_info(channel->log, "%s",
+			 "Unsaved peer failed."
 			 " Deleting channel.");
 		delete_channel(channel);
 		return;
@@ -501,8 +539,7 @@ void channel_errmsg(struct channel *channel,
 	/* This is us, sending a warning.  */
 	if (warning) {
 		channel_fail_transient(channel, disconnect, "%s sent %s",
-				       channel->owner->name,
-				       desc);
+				       channel->owner->name, desc);
 		return;
 	}
 
@@ -529,28 +566,25 @@ void channel_errmsg(struct channel *channel,
 	 *    - if `channel_id` is all zero:
 	 *       - MUST fail all channels with the sending node.
 	 *    - otherwise:
-	 *      - MUST fail the channel referred to by `channel_id`, if that channel is with the
-	 *        sending node.
+	 *      - MUST fail the channel referred to by `channel_id`, if that
+	 *channel is with the sending node.
 	 */
 
 	/* FIXME: We don't close all channels */
 	/* We should immediately forget the channel if we receive error during
 	 * CHANNELD_AWAITING_LOCKIN if we are fundee. */
-	if (!err_for_them && channel->opener == REMOTE
-	    && channel->state == CHANNELD_AWAITING_LOCKIN)
-		channel_fail_forget(channel, "%s: %s %s",
-				    channel->owner->name,
+	if (!err_for_them && channel->opener == REMOTE &&
+	    channel->state == CHANNELD_AWAITING_LOCKIN)
+		channel_fail_forget(channel, "%s: %s %s", channel->owner->name,
 				    err_for_them ? "sent" : "received", desc);
 	else
-		channel_fail_permanent(channel,
-				       err_for_them ? REASON_LOCAL : REASON_PROTOCOL,
-				       "%s: %s %s",
-				       channel->owner->name,
-				       err_for_them ? "sent" : "received", desc);
+		channel_fail_permanent(
+		    channel, err_for_them ? REASON_LOCAL : REASON_PROTOCOL,
+		    "%s: %s %s", channel->owner->name,
+		    err_for_them ? "sent" : "received", desc);
 }
 
-static void json_add_htlcs(struct lightningd *ld,
-			   struct json_stream *response,
+static void json_add_htlcs(struct lightningd *ld, struct json_stream *response,
 			   const struct channel *channel)
 {
 	/* FIXME: make per-channel htlc maps! */
@@ -558,13 +592,12 @@ static void json_add_htlcs(struct lightningd *ld,
 	struct htlc_in_map_iter ini;
 	const struct htlc_out *hout;
 	struct htlc_out_map_iter outi;
-	u32 local_feerate = get_feerate(channel->fee_states,
-					channel->opener, LOCAL);
+	u32 local_feerate =
+	    get_feerate(channel->fee_states, channel->opener, LOCAL);
 
 	/* FIXME: Add more fields. */
 	json_array_start(response, "htlcs");
-	for (hin = htlc_in_map_first(ld->htlcs_in, &ini);
-	     hin;
+	for (hin = htlc_in_map_first(ld->htlcs_in, &ini); hin;
 	     hin = htlc_in_map_next(ld->htlcs_in, &ini)) {
 		if (hin->key.channel != channel)
 			continue;
@@ -577,18 +610,18 @@ static void json_add_htlcs(struct lightningd *ld,
 		json_add_sha256(response, "payment_hash", &hin->payment_hash);
 		json_add_string(response, "state",
 				htlc_state_name(hin->hstate));
-		if (htlc_is_trimmed(REMOTE, hin->msat, local_feerate,
-				    channel->our_config.dust_limit, LOCAL,
-				    channel_has(channel, OPT_ANCHOR_OUTPUTS),
-				    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX)))
+		if (htlc_is_trimmed(
+			REMOTE, hin->msat, local_feerate,
+			channel->our_config.dust_limit, LOCAL,
+			channel_has(channel, OPT_ANCHOR_OUTPUTS),
+			channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX)))
 			json_add_bool(response, "local_trimmed", true);
 		if (hin->status != NULL)
 			json_add_string(response, "status", hin->status);
 		json_object_end(response);
 	}
 
-	for (hout = htlc_out_map_first(ld->htlcs_out, &outi);
-	     hout;
+	for (hout = htlc_out_map_first(ld->htlcs_out, &outi); hout;
 	     hout = htlc_out_map_next(ld->htlcs_out, &outi)) {
 		if (hout->key.channel != channel)
 			continue;
@@ -601,10 +634,11 @@ static void json_add_htlcs(struct lightningd *ld,
 		json_add_sha256(response, "payment_hash", &hout->payment_hash);
 		json_add_string(response, "state",
 				htlc_state_name(hout->hstate));
-		if (htlc_is_trimmed(LOCAL, hout->msat, local_feerate,
-				    channel->our_config.dust_limit, LOCAL,
-				    channel_has(channel, OPT_ANCHOR_OUTPUTS),
-				    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX)))
+		if (htlc_is_trimmed(
+			LOCAL, hout->msat, local_feerate,
+			channel->our_config.dust_limit, LOCAL,
+			channel_has(channel, OPT_ANCHOR_OUTPUTS),
+			channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX)))
 			json_add_bool(response, "local_trimmed", true);
 		json_object_end(response);
 	}
@@ -613,8 +647,7 @@ static void json_add_htlcs(struct lightningd *ld,
 
 /* Fee a commitment transaction would currently cost */
 static struct amount_sat commit_txfee(const struct channel *channel,
-				      struct amount_msat amount,
-				      enum side side)
+				      struct amount_msat amount, enum side side)
 {
 	/* FIXME: make per-channel htlc maps! */
 	const struct htlc_in *hin;
@@ -623,12 +656,12 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 	struct htlc_out_map_iter outi;
 	struct lightningd *ld = channel->peer->ld;
 	size_t num_untrimmed_htlcs = 0;
-	u32 feerate = get_feerate(channel->fee_states,
-				  channel->opener, side);
+	u32 feerate = get_feerate(channel->fee_states, channel->opener, side);
 	struct amount_sat dust_limit;
 	struct amount_sat fee;
 	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
-	bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
+	bool option_anchors_zero_fee_htlc_tx =
+	    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 
 	if (side == LOCAL)
 		dust_limit = channel->our_config.dust_limit;
@@ -637,25 +670,26 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 
 	/* Assume we tried to add "amount" */
 	if (!htlc_is_trimmed(side, amount, feerate, dust_limit, side,
-			     option_anchor_outputs, option_anchors_zero_fee_htlc_tx))
+			     option_anchor_outputs,
+			     option_anchors_zero_fee_htlc_tx))
 		num_untrimmed_htlcs++;
 
-	for (hin = htlc_in_map_first(ld->htlcs_in, &ini);
-	     hin;
+	for (hin = htlc_in_map_first(ld->htlcs_in, &ini); hin;
 	     hin = htlc_in_map_next(ld->htlcs_in, &ini)) {
 		if (hin->key.channel != channel)
 			continue;
 		if (!htlc_is_trimmed(!side, hin->msat, feerate, dust_limit,
-				     side, option_anchor_outputs, option_anchors_zero_fee_htlc_tx))
+				     side, option_anchor_outputs,
+				     option_anchors_zero_fee_htlc_tx))
 			num_untrimmed_htlcs++;
 	}
-	for (hout = htlc_out_map_first(ld->htlcs_out, &outi);
-	     hout;
+	for (hout = htlc_out_map_first(ld->htlcs_out, &outi); hout;
 	     hout = htlc_out_map_next(ld->htlcs_out, &outi)) {
 		if (hout->key.channel != channel)
 			continue;
 		if (!htlc_is_trimmed(side, hout->msat, feerate, dust_limit,
-				     side, option_anchor_outputs, option_anchors_zero_fee_htlc_tx))
+				     side, option_anchor_outputs,
+				     option_anchors_zero_fee_htlc_tx))
 			num_untrimmed_htlcs++;
 	}
 
@@ -670,9 +704,10 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 	 *   reserve. It is recommended that this "fee spike buffer" can
 	 *   handle twice the current `feerate_per_kw` to ensure
 	 *   predictability between implementations.
-	*/
+	 */
 	fee = commit_tx_base_fee(2 * feerate, num_untrimmed_htlcs + 1,
-				 option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
+				 option_anchor_outputs,
+				 option_anchors_zero_fee_htlc_tx);
 
 	if (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) {
 		/* BOLT #3:
@@ -695,8 +730,7 @@ static void subtract_offered_htlcs(const struct channel *channel,
 	struct htlc_out_map_iter outi;
 	struct lightningd *ld = channel->peer->ld;
 
-	for (hout = htlc_out_map_first(ld->htlcs_out, &outi);
-	     hout;
+	for (hout = htlc_out_map_first(ld->htlcs_out, &outi); hout;
 	     hout = htlc_out_map_next(ld->htlcs_out, &outi)) {
 		if (hout->key.channel != channel)
 			continue;
@@ -712,8 +746,7 @@ static void subtract_received_htlcs(const struct channel *channel,
 	struct htlc_in_map_iter ini;
 	struct lightningd *ld = channel->peer->ld;
 
-	for (hin = htlc_in_map_first(ld->htlcs_in, &ini);
-	     hin;
+	for (hin = htlc_in_map_first(ld->htlcs_in, &ini); hin;
 	     hin = htlc_in_map_next(ld->htlcs_in, &ini)) {
 		if (hin->key.channel != channel)
 			continue;
@@ -728,9 +761,9 @@ struct amount_msat channel_amount_spendable(const struct channel *channel)
 	bool wumbo;
 
 	/* Compute how much we can send via this channel in one payment. */
-	if (!amount_msat_sub_sat(&spendable,
-				 channel->our_msat,
-				 channel->channel_info.their_config.channel_reserve))
+	if (!amount_msat_sub_sat(
+		&spendable, channel->our_msat,
+		channel->channel_info.their_config.channel_reserve))
 		return AMOUNT_MSAT(0);
 
 	/* Take away any currently-offered HTLCs. */
@@ -738,9 +771,9 @@ struct amount_msat channel_amount_spendable(const struct channel *channel)
 
 	/* If we're opener, subtract txfees we'll need to spend this */
 	if (channel->opener == LOCAL) {
-		if (!amount_msat_sub_sat(&spendable, spendable,
-					 commit_txfee(channel, spendable,
-						      LOCAL)))
+		if (!amount_msat_sub_sat(
+			&spendable, spendable,
+			commit_txfee(channel, spendable, LOCAL)))
 			return AMOUNT_MSAT(0);
 	}
 
@@ -754,8 +787,8 @@ struct amount_msat channel_amount_spendable(const struct channel *channel)
 				   OPT_LARGE_CHANNELS);
 
 	/* We can't offer an HTLC over the max payment threshold either. */
-	if (amount_msat_greater(spendable, chainparams->max_payment)
-	    && !wumbo) {
+	if (amount_msat_greater(spendable, chainparams->max_payment) &&
+	    !wumbo) {
 		spendable = chainparams->max_payment;
 	}
 
@@ -768,12 +801,11 @@ struct amount_msat channel_amount_receivable(const struct channel *channel)
 	bool wumbo;
 
 	/* Compute how much we can receive via this channel in one payment */
-	if (!amount_sat_sub_msat(&their_msat,
-				 channel->funding_sats, channel->our_msat))
+	if (!amount_sat_sub_msat(&their_msat, channel->funding_sats,
+				 channel->our_msat))
 		their_msat = AMOUNT_MSAT(0);
 
-	if (!amount_msat_sub_sat(&receivable,
-				 their_msat,
+	if (!amount_msat_sub_sat(&receivable, their_msat,
 				 channel->our_config.channel_reserve))
 		return AMOUNT_MSAT(0);
 
@@ -782,9 +814,9 @@ struct amount_msat channel_amount_receivable(const struct channel *channel)
 
 	/* If they're opener, subtract txfees they'll need to spend this */
 	if (channel->opener == REMOTE) {
-		if (!amount_msat_sub_sat(&receivable, receivable,
-					 commit_txfee(channel,
-						      receivable, REMOTE)))
+		if (!amount_msat_sub_sat(
+			&receivable, receivable,
+			commit_txfee(channel, receivable, REMOTE)))
 			return AMOUNT_MSAT(0);
 	}
 
@@ -797,23 +829,23 @@ struct amount_msat channel_amount_receivable(const struct channel *channel)
 				   OPT_LARGE_CHANNELS);
 
 	/* They can't offer an HTLC over the max payment threshold either. */
-	if (amount_msat_greater(receivable, chainparams->max_payment)
-	    && !wumbo) {
+	if (amount_msat_greater(receivable, chainparams->max_payment) &&
+	    !wumbo) {
 		receivable = chainparams->max_payment;
 	}
 
 	return receivable;
 }
 
-void json_add_channel_type(struct json_stream *response,
-			   const char *fieldname,
+void json_add_channel_type(struct json_stream *response, const char *fieldname,
 			   const struct channel_type *channel_type)
 {
 	const char **fnames;
 
 	json_object_start(response, fieldname);
 	json_array_start(response, "bits");
-	for (size_t i = 0; i < tal_bytelen(channel_type->features) * CHAR_BIT; i++) {
+	for (size_t i = 0; i < tal_bytelen(channel_type->features) * CHAR_BIT;
+	     i++) {
 		if (!feature_is_set(channel_type->features, i))
 			continue;
 		json_add_u64(response, NULL, i);
@@ -843,21 +875,22 @@ static void json_add_channel(struct lightningd *ld,
 	json_object_start(response, key);
 	if (peer) {
 		json_add_node_id(response, "peer_id", &peer->id);
-		json_add_bool(response, "peer_connected", peer->connected == PEER_CONNECTED);
+		json_add_bool(response, "peer_connected",
+			      peer->connected == PEER_CONNECTED);
 		json_add_channel_type(response, "channel_type", channel->type);
 		if (channel->ignore_fee_limits) {
-			json_add_bool(response, "ignore_fee_limits", channel->ignore_fee_limits);
+			json_add_bool(response, "ignore_fee_limits",
+				      channel->ignore_fee_limits);
 		}
 		/* This reflects current gossip */
 		json_object_start(response, "updates");
 		json_object_start(response, "local");
-		json_add_amount_msat(response,
-				     "htlc_minimum_msat",
+		json_add_amount_msat(response, "htlc_minimum_msat",
 				     channel->htlc_minimum_msat);
-		json_add_amount_msat(response,
-				     "htlc_maximum_msat",
+		json_add_amount_msat(response, "htlc_maximum_msat",
 				     channel->htlc_maximum_msat);
-		json_add_u32(response, "cltv_expiry_delta", ld->config.cltv_expiry_delta);
+		json_add_u32(response, "cltv_expiry_delta",
+			     ld->config.cltv_expiry_delta);
 		json_add_amount_msat(response, "fee_base_msat",
 				     amount_msat(channel->feerate_base));
 		json_add_u32(response, "fee_proportional_millionths",
@@ -865,15 +898,17 @@ static void json_add_channel(struct lightningd *ld,
 		json_object_end(response);
 		if (channel->peer_update) {
 			json_object_start(response, "remote");
-			json_add_amount_msat(response,
-					     "htlc_minimum_msat",
-					     channel->peer_update->htlc_minimum_msat);
-			json_add_amount_msat(response,
-					     "htlc_maximum_msat",
-					     channel->peer_update->htlc_maximum_msat);
-			json_add_u32(response, "cltv_expiry_delta", channel->peer_update->cltv_delta);
-			json_add_amount_msat(response, "fee_base_msat",
-					     amount_msat(channel->peer_update->fee_base));
+			json_add_amount_msat(
+			    response, "htlc_minimum_msat",
+			    channel->peer_update->htlc_minimum_msat);
+			json_add_amount_msat(
+			    response, "htlc_maximum_msat",
+			    channel->peer_update->htlc_maximum_msat);
+			json_add_u32(response, "cltv_expiry_delta",
+				     channel->peer_update->cltv_delta);
+			json_add_amount_msat(
+			    response, "fee_base_msat",
+			    amount_msat(channel->peer_update->fee_base));
 			json_add_u32(response, "fee_proportional_millionths",
 				     channel->peer_update->fee_ppm);
 			json_object_end(response);
@@ -882,13 +917,15 @@ static void json_add_channel(struct lightningd *ld,
 	}
 
 	json_add_string(response, "state", channel_state_name(channel));
-	if (channel->last_tx && !invalid_last_tx(channel->last_tx)) {
+	if (!channel->our_config.is_eltoo && channel->last_tx &&
+	    !invalid_last_tx(channel->last_tx)) {
 		struct bitcoin_txid txid;
 		bitcoin_txid(channel->last_tx, &txid);
 
 		json_add_txid(response, "scratch_txid", &txid);
-		json_add_amount_sat_msat(response, "last_tx_fee_msat",
-					 bitcoin_tx_compute_fee(channel->last_tx));
+		json_add_amount_sat_msat(
+		    response, "last_tx_fee_msat",
+		    bitcoin_tx_compute_fee(channel->last_tx));
 	}
 
 	json_object_start(response, "feerate");
@@ -913,8 +950,9 @@ static void json_add_channel(struct lightningd *ld,
 		json_add_num(response, "direction",
 			     node_id_idx(&ld->id, &channel->peer->id));
 
-	json_add_string(response, "channel_id",
-			type_to_string(tmpctx, struct channel_id, &channel->cid));
+	json_add_string(
+	    response, "channel_id",
+	    type_to_string(tmpctx, struct channel_id, &channel->cid));
 	json_add_txid(response, "funding_txid", &channel->funding.txid);
 	json_add_num(response, "funding_outnum", channel->funding.n);
 
@@ -922,10 +960,10 @@ static void json_add_channel(struct lightningd *ld,
 		struct channel_inflight *initial, *inflight;
 		u32 last_feerate, next_feerate;
 
-		initial = list_top(&channel->inflights,
-				   struct channel_inflight, list);
+		initial = list_top(&channel->inflights, struct channel_inflight,
+				   list);
 		json_add_string(response, "initial_feerate",
-			        tal_fmt(tmpctx, "%d%s",
+				tal_fmt(tmpctx, "%d%s",
 					initial->funding->feerate,
 					feerate_style_name(FEERATE_PER_KSIPA)));
 
@@ -948,7 +986,8 @@ static void json_add_channel(struct lightningd *ld,
 
 		/* List the inflights */
 		json_array_start(response, "inflight");
-		list_for_each(&channel->inflights, inflight, list) {
+		list_for_each(&channel->inflights, inflight, list)
+		{
 			struct bitcoin_txid txid;
 
 			json_object_start(response, NULL);
@@ -956,22 +995,20 @@ static void json_add_channel(struct lightningd *ld,
 				      &inflight->funding->outpoint.txid);
 			json_add_num(response, "funding_outnum",
 				     inflight->funding->outpoint.n);
-			json_add_string(response, "feerate",
-					tal_fmt(tmpctx, "%d%s",
-						inflight->funding->feerate,
-						feerate_style_name(
-							FEERATE_PER_KSIPA)));
-			json_add_amount_sat_msat(response,
-						 "total_funding_msat",
-						 inflight->funding->total_funds);
-			json_add_amount_sat_msat(response,
-						 "our_funding_msat",
+			json_add_string(
+			    response, "feerate",
+			    tal_fmt(tmpctx, "%d%s", inflight->funding->feerate,
+				    feerate_style_name(FEERATE_PER_KSIPA)));
+			json_add_amount_sat_msat(
+			    response, "total_funding_msat",
+			    inflight->funding->total_funds);
+			json_add_amount_sat_msat(response, "our_funding_msat",
 						 inflight->funding->our_funds);
-			json_add_s64(response,
-				     "splice_amount",
+			json_add_s64(response, "splice_amount",
 				     inflight->funding->splice_amnt);
 			/* Add the expected commitment tx id also */
-			if (inflight->last_tx) {
+			if (!channel->our_config.is_eltoo &&
+			    inflight->last_tx) {
 				bitcoin_txid(inflight->last_tx, &txid);
 				json_add_txid(response, "scratch_txid", &txid);
 			}
@@ -981,9 +1018,8 @@ static void json_add_channel(struct lightningd *ld,
 	}
 
 	if (channel->shutdown_scriptpubkey[LOCAL]) {
-		char *addr = encode_scriptpubkey_to_addr(tmpctx,
-					chainparams,
-					channel->shutdown_scriptpubkey[LOCAL]);
+		char *addr = encode_scriptpubkey_to_addr(
+		    tmpctx, chainparams, channel->shutdown_scriptpubkey[LOCAL]);
 		if (addr)
 			json_add_string(response, "close_to_addr", addr);
 		json_add_hex_talarr(response, "close_to",
@@ -996,11 +1032,11 @@ static void json_add_channel(struct lightningd *ld,
 
 	/* opener and closer */
 	assert(channel->opener != NUM_SIDES);
-	json_add_string(response, "opener", channel->opener == LOCAL ?
-					    "local" : "remote");
+	json_add_string(response, "opener",
+			channel->opener == LOCAL ? "local" : "remote");
 	if (channel->closer != NUM_SIDES)
-		json_add_string(response, "closer", channel->closer == LOCAL ?
-						    "local" : "remote");
+		json_add_string(response, "closer",
+				channel->closer == LOCAL ? "local" : "remote");
 
 	if (channel->alias[LOCAL] || channel->alias[REMOTE]) {
 		json_object_start(response, "alias");
@@ -1019,7 +1055,8 @@ static void json_add_channel(struct lightningd *ld,
 	if (channel_has(channel, OPT_ANCHOR_OUTPUTS))
 		json_add_string(response, NULL, "option_anchor_outputs");
 	if (channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX))
-		json_add_string(response, NULL, "option_anchors_zero_fee_htlc_tx");
+		json_add_string(response, NULL,
+				"option_anchors_zero_fee_htlc_tx");
 	if (channel_has(channel, OPT_ZEROCONF))
 		json_add_string(response, NULL, "option_zeroconf");
 	if (channel_has(channel, OPT_SCID_ALIAS))
@@ -1051,12 +1088,14 @@ static void json_add_channel(struct lightningd *ld,
 		}
 
 		if (channel->opener == LOCAL) {
-			if (!amount_sat_add(&total, funds, channel->our_funds)) {
+			if (!amount_sat_add(&total, funds,
+					    channel->our_funds)) {
 				log_broken(channel->log,
 					   "Overflow adding our_funds to push");
 				total = channel->our_funds;
 			}
-			json_add_amount_sat_msat(response, "local_funds_msat", total);
+			json_add_amount_sat_msat(response, "local_funds_msat",
+						 total);
 
 			if (!amount_sat_sub(&total, peer_funded_sats, funds)) {
 				log_broken(channel->log,
@@ -1064,52 +1103,55 @@ static void json_add_channel(struct lightningd *ld,
 					   " peer's funds");
 				total = peer_funded_sats;
 			}
-			json_add_amount_sat_msat(response, "remote_funds_msat", total);
+			json_add_amount_sat_msat(response, "remote_funds_msat",
+						 total);
 
 			json_add_amount_msat(response, "fee_paid_msat",
 					     channel->push);
 		} else {
 			if (!amount_sat_add(&total, peer_funded_sats, funds)) {
-				log_broken(channel->log,
-					   "Overflow adding peer funds to push");
+				log_broken(
+				    channel->log,
+				    "Overflow adding peer funds to push");
 				total = peer_funded_sats;
 			}
-			json_add_amount_sat_msat(response, "remote_funds_msat", total);
+			json_add_amount_sat_msat(response, "remote_funds_msat",
+						 total);
 
-			if (!amount_sat_sub(&total, channel->our_funds, funds)) {
+			if (!amount_sat_sub(&total, channel->our_funds,
+					    funds)) {
 				log_broken(channel->log,
 					   "Underflow sub'ing push from"
 					   " our_funds");
 				total = channel->our_funds;
 			}
-			json_add_amount_sat_msat(response, "local_funds_msat", total);
+			json_add_amount_sat_msat(response, "local_funds_msat",
+						 total);
 			json_add_amount_msat(response, "fee_rcvd_msat",
 					     channel->push);
 		}
 
 	} else {
 		json_add_amount_sat_msat(response, "local_funds_msat",
-				  channel->our_funds);
+					 channel->our_funds);
 		json_add_amount_sat_msat(response, "remote_funds_msat",
-				  peer_funded_sats);
-		json_add_amount_msat(response, "pushed_msat",
-				     channel->push);
+					 peer_funded_sats);
+		json_add_amount_msat(response, "pushed_msat", channel->push);
 	}
 
 	json_object_end(response);
 
 	if (!amount_sat_to_msat(&funding_msat, channel->funding_sats)) {
-		log_broken(channel->log,
-			   "Overflow converting funding %s",
+		log_broken(channel->log, "Overflow converting funding %s",
 			   type_to_string(tmpctx, struct amount_sat,
 					  &channel->funding_sats));
 		funding_msat = AMOUNT_MSAT(0);
 	}
 	json_add_amount_msat(response, "to_us_msat", channel->our_msat);
-	json_add_amount_msat(response,
-			     "min_to_us_msat", channel->msat_to_us_min);
-	json_add_amount_msat(response,
-			     "max_to_us_msat", channel->msat_to_us_max);
+	json_add_amount_msat(response, "min_to_us_msat",
+			     channel->msat_to_us_min);
+	json_add_amount_msat(response, "max_to_us_msat",
+			     channel->msat_to_us_max);
 	json_add_amount_msat(response, "total_msat", funding_msat);
 
 	/* routing fees */
@@ -1131,31 +1173,25 @@ static void json_add_channel(struct lightningd *ld,
 	 * is imposed on their side, while their
 	 * configuration `channel_reserve_satoshis` is
 	 * imposed on ours. */
-	json_add_amount_sat_msat(response,
-				 "their_reserve_msat",
+	json_add_amount_sat_msat(response, "their_reserve_msat",
 				 channel->our_config.channel_reserve);
-	json_add_amount_sat_msat(response,
-				 "our_reserve_msat",
-				 channel->channel_info.their_config.channel_reserve);
+	json_add_amount_sat_msat(
+	    response, "our_reserve_msat",
+	    channel->channel_info.their_config.channel_reserve);
 
 	/* append spendable to JSON output */
-	json_add_amount_msat(response,
-			     "spendable_msat",
+	json_add_amount_msat(response, "spendable_msat",
 			     channel_amount_spendable(channel));
 
 	/* append receivable to JSON output */
-	json_add_amount_msat(response,
-			     "receivable_msat",
+	json_add_amount_msat(response, "receivable_msat",
 			     channel_amount_receivable(channel));
 
-	json_add_amount_msat(response,
-			     "minimum_htlc_in_msat",
+	json_add_amount_msat(response, "minimum_htlc_in_msat",
 			     channel->our_config.htlc_minimum);
-	json_add_amount_msat(response,
-			     "minimum_htlc_out_msat",
+	json_add_amount_msat(response, "minimum_htlc_out_msat",
 			     channel->htlc_minimum_msat);
-	json_add_amount_msat(response,
-			     "maximum_htlc_out_msat",
+	json_add_amount_msat(response, "maximum_htlc_out_msat",
 			     channel->htlc_maximum_msat);
 
 	/* The `to_self_delay` is imposed on the *other*
@@ -1169,7 +1205,8 @@ static void json_add_channel(struct lightningd *ld,
 	json_add_num(response, "max_accepted_htlcs",
 		     channel->our_config.max_accepted_htlcs);
 
-	state_changes = wallet_state_change_get(ld->wallet, tmpctx, channel->dbid);
+	state_changes =
+	    wallet_state_change_get(ld->wallet, tmpctx, channel->dbid);
 	json_array_start(response, "state_changes");
 	for (size_t i = 0; i < tal_count(state_changes); i++) {
 		json_object_start(response, NULL);
@@ -1179,8 +1216,9 @@ static void json_add_channel(struct lightningd *ld,
 				channel_state_str(state_changes[i].old_state));
 		json_add_string(response, "new_state",
 				channel_state_str(state_changes[i].new_state));
-		json_add_string(response, "cause",
-				channel_change_state_reason_str(state_changes[i].cause));
+		json_add_string(
+		    response, "cause",
+		    channel_change_state_reason_str(state_changes[i].cause));
 		json_add_string(response, "message", state_changes[i].message);
 		json_object_end(response);
 	}
@@ -1201,26 +1239,90 @@ static void json_add_channel(struct lightningd *ld,
 	wallet_channel_stats_load(ld->wallet, channel->dbid, &channel_stats);
 	json_add_u64(response, "in_payments_offered",
 		     channel_stats.in_payments_offered);
-	json_add_amount_msat(response,
-			     "in_offered_msat",
+	json_add_amount_msat(response, "in_offered_msat",
 			     channel_stats.in_msatoshi_offered);
 	json_add_u64(response, "in_payments_fulfilled",
 		     channel_stats.in_payments_fulfilled);
-	json_add_amount_msat(response,
-			     "in_fulfilled_msat",
+	json_add_amount_msat(response, "in_fulfilled_msat",
 			     channel_stats.in_msatoshi_fulfilled);
 	json_add_u64(response, "out_payments_offered",
 		     channel_stats.out_payments_offered);
-	json_add_amount_msat(response,
-			     "out_offered_msat",
+	json_add_amount_msat(response, "out_offered_msat",
 			     channel_stats.out_msatoshi_offered);
 	json_add_u64(response, "out_payments_fulfilled",
 		     channel_stats.out_payments_fulfilled);
-	json_add_amount_msat(response,
-			     "out_fulfilled_msat",
+	json_add_amount_msat(response, "out_fulfilled_msat",
 			     channel_stats.out_msatoshi_fulfilled);
 
 	json_add_htlcs(ld, response, channel);
+
+	if (channel->our_config.is_eltoo) {
+		struct bitcoin_tx **bound_update_and_settle_txs;
+		/* Eltoo keyset should probably have all pubkeys... */
+		if (channel->onchain_invalidated_annex_hint) {
+			/* If channel has this set, it means eltoo_onchaind has
+			 * reported an invalidated state output onchain */
+			bound_update_and_settle_txs =
+			    bind_txs_to_update_outpoint(
+				channel->eltoo_keyset.complete_update_tx,
+				&channel->onchain_state_outpoint,
+				channel->eltoo_keyset.complete_settle_tx,
+				channel->onchain_invalidated_annex_hint,
+				channel->onchain_invalidated_update_num,
+				&channel->eltoo_keyset.last_complete_state
+				     .self_psig,
+				&channel->eltoo_keyset.last_complete_state
+				     .other_psig,
+				&channel->local_funding_pubkey,
+				&channel->channel_info.remote_fundingkey,
+				&channel->eltoo_keyset.last_complete_state
+				     .session);
+
+		} else {
+			bound_update_and_settle_txs =
+			    bind_txs_to_funding_outpoint(
+				channel->eltoo_keyset.complete_update_tx,
+				&channel->funding,
+				channel->eltoo_keyset.complete_settle_tx,
+				&channel->eltoo_keyset.last_complete_state
+				     .self_psig,
+				&channel->eltoo_keyset.last_complete_state
+				     .other_psig,
+				&channel->local_funding_pubkey,
+				&channel->channel_info.remote_fundingkey,
+				&channel->eltoo_keyset.last_complete_state
+				     .session);
+		}
+		json_add_tx(response, "last_update_tx",
+			    bound_update_and_settle_txs[0]);
+		json_add_tx(response, "last_settle_tx",
+			    bound_update_and_settle_txs[1]);
+		tal_free(bound_update_and_settle_txs[0]);
+		tal_free(bound_update_and_settle_txs[1]);
+		json_add_tx(response, "unbound_update_tx",
+			    channel->eltoo_keyset.complete_update_tx);
+		json_add_tx(response, "unbound_settle_tx",
+			    channel->eltoo_keyset.complete_settle_tx);
+
+		/* Committed settle tx exists, rebind it with latest hint then
+		 * unbind right after (just prevout modification) */
+		if (channel->eltoo_keyset.committed_settle_tx) {
+			struct bitcoin_outpoint blank_out;
+			memset(blank_out.txid.shad.sha.u.u8, 0,
+			       sizeof(blank_out.txid));
+			blank_out.n = 0;
+			bind_settle_tx(
+			    channel->onchain_committed_hint.txid,
+			    channel->onchain_committed_hint.n,
+			    channel->eltoo_keyset.committed_settle_tx);
+			json_add_tx(response, "last_committed_settle_tx",
+				    channel->eltoo_keyset.committed_settle_tx);
+			bind_settle_tx(
+			    blank_out.txid, blank_out.n,
+			    channel->eltoo_keyset.committed_settle_tx);
+		}
+	}
+
 	json_object_end(response);
 }
 
@@ -1245,18 +1347,19 @@ peer_connected_serialize(struct peer_connected_hook_payload *payload,
 	    stream, "addr",
 	    type_to_string(stream, struct wireaddr_internal, &payload->addr));
 	if (payload->remote_addr)
-		json_add_string(
-		    stream, "remote_addr",
-		    type_to_string(stream, struct wireaddr, payload->remote_addr));
+		json_add_string(stream, "remote_addr",
+				type_to_string(stream, struct wireaddr,
+					       payload->remote_addr));
 	/* Since this is start of hook, peer is always in table! */
-	json_add_hex_talarr(stream, "features",
-			    peer_by_id(payload->ld, &payload->peer_id)
-			    ->their_features);
+	json_add_hex_talarr(
+	    stream, "features",
+	    peer_by_id(payload->ld, &payload->peer_id)->their_features);
 	json_object_end(stream); /* .peer */
 }
 
 /* Talk to connectd about an active channel */
-static void connect_activate_subd(struct lightningd *ld, struct channel *channel)
+static void connect_activate_subd(struct lightningd *ld,
+				  struct channel *channel)
 {
 	const u8 *error;
 	int fds[2];
@@ -1295,8 +1398,8 @@ static void connect_activate_subd(struct lightningd *ld, struct channel *channel
 			goto send_error;
 		}
 		if (peer_restart_dualopend(channel->peer,
-					   new_peer_fd(tmpctx, fds[0]),
-					   channel, false))
+					   new_peer_fd(tmpctx, fds[0]), channel,
+					   false))
 			goto tell_connectd;
 		close(fds[1]);
 		return;
@@ -1315,10 +1418,8 @@ static void connect_activate_subd(struct lightningd *ld, struct channel *channel
 						  "Trouble in paradise?");
 			goto send_error;
 		}
-		if (peer_start_channeld(channel,
-					new_peer_fd(tmpctx, fds[0]),
-					NULL, true,
-					NULL)) {
+		if (peer_start_channeld(channel, new_peer_fd(tmpctx, fds[0]),
+					NULL, true, NULL)) {
 			goto tell_connectd;
 		}
 		close(fds[1]);
@@ -1328,24 +1429,24 @@ static void connect_activate_subd(struct lightningd *ld, struct channel *channel
 
 tell_connectd:
 	subd_send_msg(ld->connectd,
-		      take(towire_connectd_peer_connect_subd(NULL,
-							     &channel->peer->id,
-							     channel->peer->connectd_counter,
-							     &channel->cid)));
+		      take(towire_connectd_peer_connect_subd(
+			  NULL, &channel->peer->id,
+			  channel->peer->connectd_counter, &channel->cid)));
 	subd_send_fd(ld->connectd, fds[1]);
 	return;
 
 send_error:
 	log_debug(channel->log, "Telling connectd to send error %s",
-		       tal_hex(tmpctx, error));
+		  tal_hex(tmpctx, error));
 	/* Get connectd to send error and close. */
 	subd_send_msg(ld->connectd,
-		      take(towire_connectd_peer_final_msg(NULL, &channel->peer->id,
-							  channel->peer->connectd_counter,
-							  error)));
+		      take(towire_connectd_peer_final_msg(
+			  NULL, &channel->peer->id,
+			  channel->peer->connectd_counter, error)));
 }
 
-static void peer_connected_hook_final(struct peer_connected_hook_payload *payload STEALS)
+static void
+peer_connected_hook_final(struct peer_connected_hook_payload *payload STEALS)
 {
 	struct lightningd *ld = payload->ld;
 	struct channel *channel;
@@ -1388,23 +1489,29 @@ static void peer_connected_hook_final(struct peer_connected_hook_payload *payloa
 
 	/* Developer hack to fail all channels on permfail line. */
 	if (dev_disconnect_permanent(ld)) {
-		list_for_each(&peer->channels, channel, list) {
+		list_for_each(&peer->channels, channel, list)
+		{
 			channel_fail_permanent(channel, REASON_LOCAL,
 					       "dev_disconnect permfail");
-			subd_send_msg(ld->connectd,
-				      take(towire_connectd_peer_final_msg(NULL, &peer->id,
-									  peer->connectd_counter,
-									  channel->error)));
+			subd_send_msg(
+			    ld->connectd,
+			    take(towire_connectd_peer_final_msg(
+				NULL, &peer->id, peer->connectd_counter,
+				channel->error)));
 		}
 		return;
 	}
 
 	/* connect appropriate subds for all (active) channels! */
-	list_for_each(&peer->channels, channel, list) {
+	list_for_each(&peer->channels, channel, list)
+	{
 		/* FIXME: It can race by opening a channel before this! */
-		if (channel_state_wants_peercomms(channel->state) && !channel->owner) {
-			log_debug(channel->log, "Peer has reconnected, state %s: connecting subd",
-				  channel_state_name(channel));
+		if (channel_state_wants_peercomms(channel->state) &&
+		    !channel->owner) {
+			log_debug(
+			    channel->log,
+			    "Peer has reconnected, state %s: connecting subd",
+			    channel_state_name(channel));
 
 			connect_activate_subd(ld, channel);
 		}
@@ -1416,15 +1523,13 @@ send_error:
 		       tal_hex(tmpctx, error));
 	/* Get connectd to send error and close. */
 	subd_send_msg(ld->connectd,
-		      take(towire_connectd_peer_final_msg(NULL, &peer->id,
-							  peer->connectd_counter,
-							  error)));
+		      take(towire_connectd_peer_final_msg(
+			  NULL, &peer->id, peer->connectd_counter, error)));
 }
 
 static bool
 peer_connected_hook_deserialize(struct peer_connected_hook_payload *payload,
-				const char *buffer,
-				const jsmntok_t *toks)
+				const char *buffer, const jsmntok_t *toks)
 {
 	struct lightningd *ld = payload->ld;
 
@@ -1442,15 +1547,16 @@ peer_connected_hook_deserialize(struct peer_connected_hook_payload *payload,
 	/* fail */
 	if (!t_res)
 		fatal("Plugin returned an invalid response to the "
-		      "peer_connected hook: %s", buffer);
+		      "peer_connected hook: %s",
+		      buffer);
 
 	/* reject */
 	if (json_tok_streq(buffer, t_res, "disconnect")) {
-		payload->error = (u8*)"";
+		payload->error = (u8 *)"";
 		if (t_err) {
-			payload->error = towire_warningfmt(tmpctx, NULL, "%.*s",
-							   t_err->end - t_err->start,
-							   buffer + t_err->start);
+			payload->error = towire_warningfmt(
+			    tmpctx, NULL, "%.*s", t_err->end - t_err->start,
+			    buffer + t_err->start);
 		}
 		log_debug(ld->log, "peer_connected hook rejects and says '%s'",
 			  payload->error);
@@ -1460,7 +1566,8 @@ peer_connected_hook_deserialize(struct peer_connected_hook_payload *payload,
 		return false;
 	} else if (!json_tok_streq(buffer, t_res, "continue"))
 		fatal("Plugin returned an invalid response to the "
-		      "peer_connected hook: %s", buffer);
+		      "peer_connected hook: %s",
+		      buffer);
 
 	/* call next hook */
 	return true;
@@ -1481,8 +1588,8 @@ static void update_remote_addr(struct lightningd *ld,
 	case ADDR_TYPE_IPV4:
 		/* init pointers first time */
 		if (ld->remote_addr_v4 == NULL) {
-			ld->remote_addr_v4 = tal_dup(ld, struct wireaddr,
-						     remote_addr);
+			ld->remote_addr_v4 =
+			    tal_dup(ld, struct wireaddr, remote_addr);
 			ld->remote_addr_v4_peer = peer_id;
 		}
 		/* if updated by the same peer just remember the latest addr */
@@ -1492,12 +1599,13 @@ static void update_remote_addr(struct lightningd *ld,
 		}
 		/* tell gossip we have a valid update */
 		if (wireaddr_eq_without_port(ld->remote_addr_v4, remote_addr)) {
-			ld->discovered_ip_v4 = tal_dup(ld, struct wireaddr,
-						       ld->remote_addr_v4);
-			ld->discovered_ip_v4->port = ld->config.ip_discovery_port;
-			subd_send_msg(ld->gossip, towire_gossipd_discovered_ip(
-							  tmpctx,
-							  ld->discovered_ip_v4));
+			ld->discovered_ip_v4 =
+			    tal_dup(ld, struct wireaddr, ld->remote_addr_v4);
+			ld->discovered_ip_v4->port =
+			    ld->config.ip_discovery_port;
+			subd_send_msg(ld->gossip,
+				      towire_gossipd_discovered_ip(
+					  tmpctx, ld->discovered_ip_v4));
 		}
 		/* store latest values */
 		*ld->remote_addr_v4 = *remote_addr;
@@ -1506,8 +1614,8 @@ static void update_remote_addr(struct lightningd *ld,
 	case ADDR_TYPE_IPV6:
 		/* same code :s/4/6/ without the comments ;) */
 		if (ld->remote_addr_v6 == NULL) {
-			ld->remote_addr_v6 = tal_dup(ld, struct wireaddr,
-						     remote_addr);
+			ld->remote_addr_v6 =
+			    tal_dup(ld, struct wireaddr, remote_addr);
 			ld->remote_addr_v6_peer = peer_id;
 		}
 		if (node_id_eq(&ld->remote_addr_v6_peer, &peer_id)) {
@@ -1515,12 +1623,13 @@ static void update_remote_addr(struct lightningd *ld,
 			break;
 		}
 		if (wireaddr_eq_without_port(ld->remote_addr_v6, remote_addr)) {
-			ld->discovered_ip_v6 = tal_dup(ld, struct wireaddr,
-						       ld->remote_addr_v6);
-			ld->discovered_ip_v6->port = ld->config.ip_discovery_port;
-			subd_send_msg(ld->gossip, towire_gossipd_discovered_ip(
-							  tmpctx,
-							  ld->discovered_ip_v6));
+			ld->discovered_ip_v6 =
+			    tal_dup(ld, struct wireaddr, ld->remote_addr_v6);
+			ld->discovered_ip_v6->port =
+			    ld->config.ip_discovery_port;
+			subd_send_msg(ld->gossip,
+				      towire_gossipd_discovered_ip(
+					  tmpctx, ld->discovered_ip_v6));
 		}
 		*ld->remote_addr_v6 = *remote_addr;
 		ld->remote_addr_v6_peer = peer_id;
@@ -1534,10 +1643,8 @@ static void update_remote_addr(struct lightningd *ld,
 	}
 }
 
-REGISTER_PLUGIN_HOOK(peer_connected,
-		     peer_connected_hook_deserialize,
-		     peer_connected_hook_final,
-		     peer_connected_serialize,
+REGISTER_PLUGIN_HOOK(peer_connected, peer_connected_hook_deserialize,
+		     peer_connected_hook_final, peer_connected_serialize,
 		     struct peer_connected_hook_payload *);
 
 /* Connectd tells us a peer has connected: it never hands us duplicates, since
@@ -1554,12 +1661,10 @@ void peer_connected(struct lightningd *ld, const u8 *msg)
 	hook_payload = tal(NULL, struct peer_connected_hook_payload);
 	hook_payload->ld = ld;
 	hook_payload->error = NULL;
-	if (!fromwire_connectd_peer_connected(hook_payload, msg,
-					      &id, &connectd_counter,
-					      &hook_payload->addr,
-					      &hook_payload->remote_addr,
-					      &hook_payload->incoming,
-					      &their_features))
+	if (!fromwire_connectd_peer_connected(
+		hook_payload, msg, &id, &connectd_counter, &hook_payload->addr,
+		&hook_payload->remote_addr, &hook_payload->incoming,
+		&their_features))
 		fatal("Connectd gave bad CONNECT_PEER_CONNECTED message %s",
 		      tal_hex(msg, msg));
 
@@ -1604,10 +1709,11 @@ void peer_connected(struct lightningd *ld, const u8 *msg)
 
 	/* Log and update remote_addr for Nat/IP discovery. */
 	if (hook_payload->remote_addr) {
-		log_peer_debug(ld->log, &id, "Peer says it sees our address as: %s",
+		log_peer_debug(ld->log, &id,
+			       "Peer says it sees our address as: %s",
 			       fmt_wireaddr(tmpctx, hook_payload->remote_addr));
-		peer->remote_addr = tal_dup(peer, struct wireaddr,
-					    hook_payload->remote_addr);
+		peer->remote_addr =
+		    tal_dup(peer, struct wireaddr, hook_payload->remote_addr);
 		/* Currently only from peers we have a channel with, until we
 		 * do stuff like probing for remote_addr to a random node. */
 		if (!list_empty(&peer->channels))
@@ -1630,11 +1736,13 @@ void peer_spoke(struct lightningd *ld, const u8 *msg)
 	struct channel_id channel_id;
 	struct peer *peer;
 	bool dual_fund;
+	bool eltoo;
 	u8 *error;
 	int fds[2];
 	char *errmsg;
 
-	if (!fromwire_connectd_peer_spoke(msg, msg, &id, &connectd_counter, &msgtype, &channel_id, &errmsg))
+	if (!fromwire_connectd_peer_spoke(msg, msg, &id, &connectd_counter,
+					  &msgtype, &channel_id, &errmsg))
 		fatal("Connectd gave bad CONNECTD_PEER_SPOKE message %s",
 		      tal_hex(msg, msg));
 
@@ -1660,8 +1768,8 @@ void peer_spoke(struct lightningd *ld, const u8 *msg)
 			}
 
 			/* If channel is active there are two possibilities:
-			 * 1. We have started subd, but channeld hasn't processed
-			 *    the connectd_peer_connect_subd message yet.
+			 * 1. We have started subd, but channeld hasn't
+			 * processed the connectd_peer_connect_subd message yet.
 			 * 2. subd exited */
 			if (channel->owner) {
 				/* We raced... */
@@ -1670,15 +1778,20 @@ void peer_spoke(struct lightningd *ld, const u8 *msg)
 
 			log_debug(channel->log, "channel already active");
 			if (channel->state == DUALOPEND_AWAITING_LOCKIN) {
-				if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
-					log_broken(ld->log,
-						   "Failed to create socketpair: %s",
-						   strerror(errno));
-					error = towire_warningfmt(tmpctx, &channel_id,
-								  "Trouble in paradise?");
+				if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) !=
+				    0) {
+					log_broken(
+					    ld->log,
+					    "Failed to create socketpair: %s",
+					    strerror(errno));
+					error = towire_warningfmt(
+					    tmpctx, &channel_id,
+					    "Trouble in paradise?");
 					goto send_error;
 				}
-				if (peer_restart_dualopend(peer, new_peer_fd(tmpctx, fds[0]), channel, false))
+				if (peer_restart_dualopend(
+					peer, new_peer_fd(tmpctx, fds[0]),
+					channel, false))
 					goto tell_connectd;
 				/* FIXME: Send informative error? */
 				close(fds[1]);
@@ -1688,115 +1801,196 @@ void peer_spoke(struct lightningd *ld, const u8 *msg)
 
 		if (msgtype == WIRE_CHANNEL_REESTABLISH) {
 			log_debug(channel->log,
-				  "Reestablish on %s channel: using channeld to reply",
+				  "Reestablish on %s channel: using channeld "
+				  "to reply",
 				  channel_state_name(channel));
 			if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
 				log_broken(channel->log,
 					   "Failed to create socketpair: %s",
 					   strerror(errno));
-				error = towire_warningfmt(tmpctx, &channel->cid,
-							  "Trouble in paradise?");
+				error =
+				    towire_warningfmt(tmpctx, &channel->cid,
+						      "Trouble in paradise?");
 				goto send_error;
 			}
-			if (peer_start_channeld(channel, new_peer_fd(tmpctx, fds[0]), NULL, true, true)) {
+			if (peer_start_channeld(channel,
+						new_peer_fd(tmpctx, fds[0]),
+						NULL, true, true)) {
 				goto tell_connectd;
 			}
 			/* FIXME: Send informative error? */
 			close(fds[1]);
 			return;
 		}
+		switch (channel->state) {
+		case ONCHAIN:
+		case FUNDING_SPEND_SEEN:
+		case CLOSINGD_COMPLETE:
+			goto channel_is_closed;
+		case CLOSED:
+			/* Channel should not have been loaded */
+			abort();
+		case AWAITING_UNILATERAL: {
+			/* channel->error is not saved in db, so this can
+			 * happen if we restart. */
+			error = towire_errorfmt(tmpctx, &channel->cid,
+						"Awaiting unilateral close");
+			goto send_error;
+		}
+		case DUALOPEND_OPEN_INIT:
+			/* We asked for this, to open? */
+			if (!msgtype && channel->open_attempt &&
+			    channel->open_attempt->open_msg) {
+				if (peer_start_dualopend(peer, peer_fd,
+							 channel))
+					subd_send_msg(
+					    channel->owner,
+					    channel->open_attempt->open_msg);
+				goto subd_setup_done;
+			}
+			/* Fall through. */
+		case DUALOPEND_AWAITING_LOCKIN:
+			assert(!channel->owner);
+			peer_restart_dualopend(peer, peer_fd, channel);
+			goto subd_setup_done;
+		case CHANNELD_AWAITING_LOCKIN:
+		case CHANNELD_NORMAL:
+		case CHANNELD_SHUTTING_DOWN:
+		case CLOSINGD_SIGEXCHANGE:
+			assert(!channel->owner);
+			if (true /* FIXME track eltoo-ness of channels */) {
+				peer_start_eltoo_channeld(channel, peer_fd,
+							  NULL, true, NULL);
+			} else {
+				peer_start_channeld(channel, peer_fd, NULL,
+						    true, NULL);
+			}
+			goto subd_setup_done;
+		}
+		abort();
+	}
 
-		/* Send generic error. */
-		error = towire_errorfmt(tmpctx, &channel_id,
-					"channel in state %s",
-					channel_state_name(channel));
+	eltoo = feature_negotiated(ld->our_features, peer->their_features,
+				   OPT_ELTOO);
+
+	/* Single funder only for now if eltoo */
+	dual_fund =
+	    !eltoo && feature_negotiated(ld->our_features, peer->their_features,
+					 OPT_DUAL_FUND);
+
+	/* Did we ask for this? */
+	if (!msgtype) {
+		/* If it was dual_fund, it will have peer_unsaved_channel above
+		 */
+		if (dual_fund) {
+			log_broken(
+			    ld->log, "Unsolicited active df peer %s?",
+			    type_to_string(tmpctx, struct node_id, &peer->id));
+		} else {
+			const struct uncommitted_channel *uc =
+			    peer->uncommitted_channel;
+
+			if (!uc->open_daemon && uc->fc && uc->fc->open_msg) {
+				if (peer_start_openingd(peer, peer_fd, eltoo)) {
+					subd_send_msg(uc->open_daemon,
+						      uc->fc->open_msg);
+				}
+			} else {
+				log_broken(
+				    ld->log, "Unsolicited active peer %s?",
+				    type_to_string(tmpctx, struct node_id,
+						   &peer->id));
+			}
+		}
+		return;
+	}
+
+	/* Send generic error. */
+	error = towire_errorfmt(tmpctx, &channel_id, "channel in state %s",
+				channel_state_name(channel));
+	goto send_error;
+}
+
+dual_fund =
+    feature_negotiated(ld->our_features, peer->their_features, OPT_DUAL_FUND);
+
+/* OK, it's an unknown channel.  Create a new one if they're trying. */
+switch (msgtype) {
+case WIRE_OPEN_CHANNEL:
+case WIRE_OPEN_CHANNEL_ELTOO:
+	if (dual_fund) {
+		error =
+		    towire_errorfmt(tmpctx, &channel_id,
+				    "OPT_DUAL_FUND: cannot use open_channel");
 		goto send_error;
 	}
-
-	dual_fund = feature_negotiated(ld->our_features,
-				       peer->their_features,
-				       OPT_DUAL_FUND);
-
-	/* OK, it's an unknown channel.  Create a new one if they're trying. */
-	switch (msgtype) {
-	case WIRE_OPEN_CHANNEL:
-		if (dual_fund) {
-			error = towire_errorfmt(tmpctx, &channel_id,
-						"OPT_DUAL_FUND: cannot use open_channel");
-			goto send_error;
-		}
-		if (peer->uncommitted_channel) {
-			error = towire_errorfmt(tmpctx, &channel_id,
-						"Multiple simulteneous opens not supported");
-			goto send_error;
-		}
-		peer->uncommitted_channel = new_uncommitted_channel(peer);
-		peer->uncommitted_channel->cid = channel_id;
-		if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
-			log_broken(ld->log,
-				   "Failed to create socketpair: %s",
-				   strerror(errno));
-			error = towire_warningfmt(tmpctx, &channel_id,
-						  "Trouble in paradise?");
-			goto send_error;
-		}
-		if (peer_start_openingd(peer, new_peer_fd(tmpctx, fds[0]))) {
-			goto tell_connectd;
-		}
-		/* FIXME: Send informative error? */
-		close(fds[1]);
-		return;
-
-	case WIRE_OPEN_CHANNEL2:
-		if (!dual_fund) {
-			error = towire_errorfmt(tmpctx, &channel_id,
-						"Didn't negotiate OPT_DUAL_FUND: cannot use open_channel2");
-			goto send_error;
-		}
-		channel = new_unsaved_channel(peer,
-					      peer->ld->config.fee_base,
-					      peer->ld->config.fee_per_satoshi);
-		channel->cid = channel_id;
-		if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
-			log_broken(ld->log,
-				   "Failed to create socketpair: %s",
-				   strerror(errno));
-			error = towire_warningfmt(tmpctx, &channel_id,
-						  "Trouble in paradise?");
-			goto send_error;
-		}
-		if (peer_start_dualopend(peer, new_peer_fd(tmpctx, fds[0]), channel))
-			goto tell_connectd;
-		/* FIXME: Send informative error? */
-		close(fds[1]);
-		return;
+	if (peer->uncommitted_channel) {
+		error = towire_errorfmt(
+		    tmpctx, &channel_id,
+		    "Multiple simulteneous opens not supported");
+		goto send_error;
 	}
-
-	/* Weird message?  Log and reply with error. */
-	log_peer_unusual(ld->log, &peer->id,
-			 "Unknown channel %s for %s",
-			 type_to_string(tmpctx, struct channel_id,
-					&channel_id),
-			 peer_wire_name(msgtype));
-	error = towire_errorfmt(tmpctx, &channel_id,
-				"Unknown channel for %s", peer_wire_name(msgtype));
-
-send_error:
-	log_peer_debug(ld->log, &peer->id, "Telling connectd to send error %s",
-		       tal_hex(tmpctx, error));
-	/* Get connectd to send error and close. */
-	subd_send_msg(ld->connectd,
-		      take(towire_connectd_peer_final_msg(NULL, &peer->id,
-							  peer->connectd_counter,
-							  error)));
+	peer->uncommitted_channel = new_uncommitted_channel(peer);
+	peer->uncommitted_channel->cid = channel_id;
+	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
+		log_broken(ld->log, "Failed to create socketpair: %s",
+			   strerror(errno));
+		error = towire_warningfmt(tmpctx, &channel_id,
+					  "Trouble in paradise?");
+		goto send_error;
+	}
+	if (peer_start_openingd(peer, new_peer_fd(tmpctx, fds[0])), eltoo) {
+		goto tell_connectd;
+	}
+	/* FIXME: Send informative error? */
+	close(fds[1]);
 	return;
+case WIRE_OPEN_CHANNEL2:
+	if (!dual_fund) {
+		error = towire_errorfmt(
+		    tmpctx, &channel_id,
+		    "Didn't negotiate OPT_DUAL_FUND: cannot use open_channel2");
+		goto send_error;
+	}
+	channel = new_unsaved_channel(peer, peer->ld->config.fee_base,
+				      peer->ld->config.fee_per_satoshi);
+	channel->cid = channel_id;
+	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
+		log_broken(ld->log, "Failed to create socketpair: %s",
+			   strerror(errno));
+		error = towire_warningfmt(tmpctx, &channel_id,
+					  "Trouble in paradise?");
+		goto send_error;
+	}
+	if (peer_start_dualopend(peer, new_peer_fd(tmpctx, fds[0]), channel))
+		goto tell_connectd;
+	/* FIXME: Send informative error? */
+	close(fds[1]);
+	return;
+}
 
-tell_connectd:
-	subd_send_msg(ld->connectd,
-		      take(towire_connectd_peer_connect_subd(NULL, &id,
-							     peer->connectd_counter,
-							     &channel_id)));
-	subd_send_fd(ld->connectd, fds[1]);
+/* Weird message?  Log and reply with error. */
+log_peer_unusual(ld->log, &peer->id, "Unknown channel %s for %s",
+		 type_to_string(tmpctx, struct channel_id, &channel_id),
+		 peer_wire_name(msgtype));
+error = towire_errorfmt(tmpctx, &channel_id, "Unknown channel for %s",
+			peer_wire_name(msgtype));
+
+send_error
+    : log_peer_debug(ld->log, &peer->id, "Telling connectd to send error %s",
+		     tal_hex(tmpctx, error));
+/* Get connectd to send error and close. */
+subd_send_msg(ld->connectd,
+	      take(towire_connectd_peer_final_msg(NULL, &peer->id,
+						  peer->connectd_counter,
+						  error)));
+return;
+
+tell_connectd
+    : subd_send_msg(ld->connectd,
+		    take(towire_connectd_peer_connect_subd(
+			NULL, &id, peer->connectd_counter, &channel_id)));
+subd_send_fd(ld->connectd, fds[1]);
 }
 
 struct disconnect_command {
@@ -1819,7 +2013,8 @@ void peer_disconnect_done(struct lightningd *ld, const u8 *msg)
 	struct disconnect_command *i, *next;
 	struct peer *p;
 
-	if (!fromwire_connectd_peer_disconnect_done(msg, &id, &connectd_counter))
+	if (!fromwire_connectd_peer_disconnect_done(msg, &id,
+						    &connectd_counter))
 		fatal("Connectd gave bad PEER_DISCONNECT_DONE message %s",
 		      tal_hex(msg, msg));
 
@@ -1834,19 +2029,20 @@ void peer_disconnect_done(struct lightningd *ld, const u8 *msg)
 	}
 
 	/* If you were trying to connect, it failed. */
-	connect_failed_disconnect(ld, &id,
-				  p && !p->connected_incoming ? &p->addr : NULL);
+	connect_failed_disconnect(
+	    ld, &id, p && !p->connected_incoming ? &p->addr : NULL);
 
 	/* Fire off plugin notifications */
 	notify_disconnect(ld, &id);
 
 	/* Wake any disconnect commands (removes self from list) */
-	list_for_each_safe(&ld->disconnect_commands, i, next, list) {
+	list_for_each_safe(&ld->disconnect_commands, i, next, list)
+	{
 		if (!node_id_eq(&i->id, &id))
 			continue;
 
-		was_pending(command_success(i->cmd,
-					    json_stream_success(i->cmd)));
+		was_pending(
+		    command_success(i->cmd, json_stream_success(i->cmd)));
 	}
 
 	/* If connection was only thing keeping it, this will delete it. */
@@ -1868,42 +2064,38 @@ void update_channel_from_inflight(struct lightningd *ld,
 	if (!amount_sat_add_sat_s64(&channel->our_funds, channel->our_funds,
 				    inflight->funding->splice_amnt)) {
 
-		channel_fail_permanent(channel,
-				       REASON_LOCAL,
-				       "Updaing channel view for splice causes"
-				       " an invalid satoshi amount wrapping,"
-				       " channel: %s, initial funds: %s, splice"
-				       " banace change: %s",
-				       type_to_string(tmpctx, struct channel_id,
-						      &channel->cid),
-				       type_to_string(tmpctx, struct amount_sat,
-						      &channel->our_funds),
-				       inflight->funding->splice_amnt);
+		channel_fail_permanent(
+		    channel, REASON_LOCAL,
+		    "Updaing channel view for splice causes"
+		    " an invalid satoshi amount wrapping,"
+		    " channel: %s, initial funds: %s, splice"
+		    " banace change: %s",
+		    type_to_string(tmpctx, struct channel_id, &channel->cid),
+		    type_to_string(tmpctx, struct amount_sat,
+				   &channel->our_funds),
+		    inflight->funding->splice_amnt);
 	}
 
 	/* Lease infos ! */
 	channel->lease_expiry = inflight->lease_expiry;
 	channel->push = inflight->lease_fee;
 	tal_free(channel->lease_commit_sig);
-	channel->lease_commit_sig
-		= tal_dup_or_null(channel, secp256k1_ecdsa_signature, inflight->lease_commit_sig);
+	channel->lease_commit_sig = tal_dup_or_null(
+	    channel, secp256k1_ecdsa_signature, inflight->lease_commit_sig);
 	channel->lease_chan_max_msat = inflight->lease_chan_max_msat;
 	channel->lease_chan_max_ppt = inflight->lease_chan_max_ppt;
 
 	tal_free(channel->blockheight_states);
-	channel->blockheight_states = new_height_states(channel,
-							channel->opener,
-							&inflight->lease_blockheight_start);
+	channel->blockheight_states = new_height_states(
+	    channel, channel->opener, &inflight->lease_blockheight_start);
 
 	/* Make a 'clone' of this tx */
 	psbt_copy = clone_psbt(channel, inflight->last_tx->psbt);
-	channel_set_last_tx(channel,
-			    bitcoin_tx_with_psbt(channel, psbt_copy),
+	channel_set_last_tx(channel, bitcoin_tx_with_psbt(channel, psbt_copy),
 			    &inflight->last_sig);
 
 	/* Update the reserve */
-	channel_update_reserve(channel,
-			       &channel->channel_info.their_config,
+	channel_update_reserve(channel, &channel->channel_info.their_config,
 			       inflight->funding->total_funds);
 
 	wallet_channel_save(ld->wallet, channel);
@@ -1925,8 +2117,8 @@ static enum watch_result funding_depth_cb(struct lightningd *ld,
 	channel->depth = depth;
 
 	log_debug(channel->log, "Funding tx %s depth %u of %u",
-		  type_to_string(tmpctx, struct bitcoin_txid, txid),
-		  depth, channel->minimum_depth);
+		  type_to_string(tmpctx, struct bitcoin_txid, txid), depth,
+		  channel->minimum_depth);
 
 	/* Reorged out? */
 	if (depth == 0) {
@@ -1937,35 +2129,41 @@ static enum watch_result funding_depth_cb(struct lightningd *ld,
 		case DUALOPEND_OPEN_COMMIT_READY:
 		case DUALOPEND_OPEN_COMMITTED:
 			/* Shouldn't be here! */
-			channel_internal_error(channel,
-					       "Bad %s state: %s",
+			channel_internal_error(channel, "Bad %s state: %s",
 					       __func__,
 					       channel_state_name(channel));
 			return DELETE_WATCH;
 		case CHANNELD_AWAITING_LOCKIN:
 			/* That's not entirely unexpected in early states */
-			log_debug(channel->log, "Funding tx %s reorganized out!",
-				  type_to_string(tmpctx, struct bitcoin_txid, txid));
+			log_debug(
+			    channel->log, "Funding tx %s reorganized out!",
+			    type_to_string(tmpctx, struct bitcoin_txid, txid));
 			channel->scid = tal_free(channel->scid);
 			return KEEP_WATCHING;
 
 		/* But it's often Bad News in later states */
 		case CHANNELD_AWAITING_SPLICE:
 		case CHANNELD_NORMAL:
-			/* If we opened, or it's zero-conf, we trust them anyway. */
-			if (channel->opener == LOCAL
-			    || channel->minimum_depth == 0) {
+			/* If we opened, or it's zero-conf, we trust them
+			 * anyway. */
+			if (channel->opener == LOCAL ||
+			    channel->minimum_depth == 0) {
 				const char *str;
 
-				str = tal_fmt(tmpctx,
-					      "Funding tx %s reorganized out, but %s...",
-					      type_to_string(tmpctx, struct bitcoin_txid, txid),
-					      channel->opener == LOCAL ? "we opened it" : "zeroconf anyway");
+				str = tal_fmt(
+				    tmpctx,
+				    "Funding tx %s reorganized out, but %s...",
+				    type_to_string(tmpctx, struct bitcoin_txid,
+						   txid),
+				    channel->opener == LOCAL
+					? "we opened it"
+					: "zeroconf anyway");
 
 				/* Log even if not connected! */
 				if (!channel->owner)
 					log_info(channel->log, "%s", str);
-				channel_fail_transient(channel, true, "%s", str);
+				channel_fail_transient(channel, true, "%s",
+						       str);
 				return KEEP_WATCHING;
 			}
 			/* fall thru */
@@ -1978,9 +2176,10 @@ static enum watch_result funding_depth_cb(struct lightningd *ld,
 		case CLOSED:
 			break;
 		}
-		channel_internal_error(channel,
-				       "Funding transaction has been reorged out in state %s!",
-				       channel_state_name(channel));
+		channel_internal_error(
+		    channel,
+		    "Funding transaction has been reorged out in state %s!",
+		    channel_state_name(channel));
 		return KEEP_WATCHING;
 	}
 
@@ -2010,15 +2209,16 @@ static enum watch_result funding_depth_cb(struct lightningd *ld,
 		return DELETE_WATCH;
 
 	case CHANNELD_AWAITING_LOCKIN:
-		if (depth >= channel->minimum_depth
-		    && channel->remote_channel_ready) {
+		if (depth >= channel->minimum_depth &&
+		    channel->remote_channel_ready) {
 			lockin_complete(channel, CHANNELD_AWAITING_LOCKIN);
 		}
 		/* Fall thru */
 	case CHANNELD_NORMAL:
 	case CHANNELD_AWAITING_SPLICE:
 		channeld_tell_depth(channel, txid, depth);
-		if (depth < ANNOUNCE_MIN_DEPTH || depth < channel->minimum_depth)
+		if (depth < ANNOUNCE_MIN_DEPTH ||
+		    depth < channel->minimum_depth)
 			return KEEP_WATCHING;
 		/* Normal state and past announce depth?  Stop bothering us! */
 		return DELETE_WATCH;
@@ -2028,7 +2228,7 @@ static enum watch_result funding_depth_cb(struct lightningd *ld,
 
 static enum watch_result funding_spent(struct channel *channel,
 				       const struct bitcoin_tx *tx,
-				       size_t inputnum UNUSED,
+				       size_t input_num UNUSED,
 				       const struct block *block)
 {
 	struct bitcoin_txid txid;
@@ -2038,9 +2238,9 @@ static enum watch_result funding_spent(struct channel *channel,
 
 	/* If we're doing a splice, we expect the funding transaction to be
 	 * spent, so don't freak out and just keep watching in that case */
-	list_for_each(&channel->inflights, inflight, list) {
-		if (bitcoin_txid_eq(&txid,
-				    &inflight->funding->outpoint.txid)) {
+	list_for_each(&channel->inflights, inflight, list)
+	{
+		if (bitcoin_txid_eq(&txid, &inflight->funding->outpoint.txid)) {
 			/* splice_locked is a special flag that indicates this
 			 * is a memory-only inflight acting as a race condition
 			 * safeguard. When we see this, it is our responsability
@@ -2064,29 +2264,26 @@ void channel_watch_wrong_funding(struct lightningd *ld, struct channel *channel)
 	/* Watch the "wrong" funding too, in case we spend it. */
 	if (channel->shutdown_wrong_funding) {
 		watch_txo(channel, ld->topology, channel,
-			  channel->shutdown_wrong_funding,
-			  funding_spent);
+			  channel->shutdown_wrong_funding, funding_spent);
 	}
 }
 
 void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 {
 	log_debug(channel->log, "Watching for funding txid: %s",
-		type_to_string(tmpctx, struct bitcoin_txid, &channel->funding.txid));
-	watch_txid(channel, ld->topology,
-		   &channel->funding.txid, funding_depth_cb, channel);
+		  type_to_string(tmpctx, struct bitcoin_txid,
+				 &channel->funding.txid));
+	watch_txid(channel, ld->topology, &channel->funding.txid,
+		   funding_depth_cb, channel);
 
 	tal_free(channel->funding_spend_watch);
-	channel->funding_spend_watch = watch_txo(channel, ld->topology, channel,
-						 &channel->funding,
-						 funding_spent);
+	channel->funding_spend_watch = watch_txo(
+	    channel, ld->topology, channel, &channel->funding, funding_spent);
 	channel_watch_wrong_funding(ld, channel);
 }
 
-static void json_add_peer(struct lightningd *ld,
-			  struct json_stream *response,
-			  struct peer *p,
-			  const enum log_level *ll)
+static void json_add_peer(struct lightningd *ld, struct json_stream *response,
+			  struct peer *p, const enum log_level *ll)
 {
 	struct channel *channel;
 	u32 num_channels;
@@ -2096,16 +2293,14 @@ static void json_add_peer(struct lightningd *ld,
 
 	json_add_bool(response, "connected", p->connected == PEER_CONNECTED);
 	num_channels = 0;
-	list_for_each(&p->channels, channel, list)
-		num_channels++;
+	list_for_each(&p->channels, channel, list) num_channels++;
 	json_add_num(response, "num_channels", num_channels);
 
 	if (p->connected == PEER_CONNECTED) {
 		json_array_start(response, "netaddr");
-		json_add_string(response, NULL,
-				type_to_string(tmpctx,
-					       struct wireaddr_internal,
-					       &p->addr));
+		json_add_string(
+		    response, NULL,
+		    type_to_string(tmpctx, struct wireaddr_internal, &p->addr));
 		json_array_end(response);
 		/* If peer reports our IP remote_addr, add that here */
 		if (p->remote_addr)
@@ -2113,18 +2308,23 @@ static void json_add_peer(struct lightningd *ld,
 					fmt_wireaddr(response, p->remote_addr));
 	}
 
-	/* Note: If !PEER_CONNECTED, peer may use different features on reconnect */
+	/* Note: If !PEER_CONNECTED, peer may use different features on
+	 * reconnect */
 	json_add_hex_talarr(response, "features", p->their_features);
 
 	if (ld->deprecated_apis) {
 		json_array_start(response, "channels");
-		json_add_uncommitted_channel(response, p->uncommitted_channel, NULL);
+		json_add_uncommitted_channel(response, p->uncommitted_channel,
+					     NULL);
 
-		list_for_each(&p->channels, channel, list) {
+		list_for_each(&p->channels, channel, list)
+		{
 			if (channel_state_uncommitted(channel->state))
-				json_add_unsaved_channel(response, channel, NULL);
+				json_add_unsaved_channel(response, channel,
+							 NULL);
 			else
-				json_add_channel(ld, response, NULL, channel, NULL);
+				json_add_channel(ld, response, NULL, channel,
+						 NULL);
 		}
 		json_array_end(response);
 	}
@@ -2146,8 +2346,7 @@ static struct command_result *json_listpeers(struct command *cmd,
 
 	if (!param(cmd, buffer, params,
 		   p_opt("id", param_node_id, &specific_id),
-		   p_opt("level", param_loglevel, &ll),
-		   NULL))
+		   p_opt("level", param_loglevel, &ll), NULL))
 		return command_param_failed();
 
 	response = json_stream_success(cmd);
@@ -2159,8 +2358,7 @@ static struct command_result *json_listpeers(struct command *cmd,
 	} else {
 		struct peer_node_id_map_iter it;
 
-		for (peer = peer_node_id_map_first(cmd->ld->peers, &it);
-		     peer;
+		for (peer = peer_node_id_map_first(cmd->ld->peers, &it); peer;
 		     peer = peer_node_id_map_next(cmd->ld->peers, &it)) {
 			json_add_peer(cmd->ld, response, peer, ll);
 		}
@@ -2171,32 +2369,26 @@ static struct command_result *json_listpeers(struct command *cmd,
 }
 
 static const struct json_command listpeers_command = {
-	"listpeers",
-	"network",
-	json_listpeers,
-	"Show current peers, if {level} is set, include logs for {id}"
-};
+    "listpeers", "network", json_listpeers,
+    "Show current peers, if {level} is set, include logs for {id}"};
 /* Comment added to satisfice AUTODATA */
 AUTODATA(json_command, &listpeers_command);
 
-static void json_add_scb(struct command *cmd,
-			 const char *fieldname,
-			 struct json_stream *response,
-			 struct channel *c)
+static void json_add_scb(struct command *cmd, const char *fieldname,
+			 struct json_stream *response, struct channel *c)
 {
 	u8 *scb = tal_arr(cmd, u8, 0);
 
 	towire_scb_chan(&scb, c->scb);
-	json_add_hex_talarr(response, fieldname,
-			    scb);
+	json_add_hex_talarr(response, fieldname, scb);
 }
 
 /* This will return a SCB for all the channels currently loaded
  * in the in-memory channel */
 static struct command_result *json_staticbackup(struct command *cmd,
-					     const char *buffer,
-					     const jsmntok_t *obj UNNEEDED,
-					     const jsmntok_t *params)
+						const char *buffer,
+						const jsmntok_t *obj UNNEEDED,
+						const jsmntok_t *params)
 {
 	struct json_stream *response;
 	struct peer *peer;
@@ -2209,10 +2401,10 @@ static struct command_result *json_staticbackup(struct command *cmd,
 	response = json_stream_success(cmd);
 
 	json_array_start(response, "scb");
-	for (peer = peer_node_id_map_first(cmd->ld->peers, &it);
-	     peer;
+	for (peer = peer_node_id_map_first(cmd->ld->peers, &it); peer;
 	     peer = peer_node_id_map_next(cmd->ld->peers, &it)) {
-		list_for_each(&peer->channels, channel, list){
+		list_for_each(&peer->channels, channel, list)
+		{
 			if (!channel->scb)
 				continue;
 			json_add_scb(cmd, NULL, response, channel);
@@ -2224,11 +2416,8 @@ static struct command_result *json_staticbackup(struct command *cmd,
 }
 
 static const struct json_command staticbackup_command = {
-	"staticbackup",
-	"backup",
-	json_staticbackup,
-	"Returns SCB of all the channels currently present in the DB"
-};
+    "staticbackup", "backup", json_staticbackup,
+    "Returns SCB of all the channels currently present in the DB"};
 /* Comment added to satisfice AUTODATA */
 AUTODATA(json_command, &staticbackup_command);
 
@@ -2239,7 +2428,8 @@ static void json_add_peerchannels(struct lightningd *ld,
 	struct channel *channel;
 
 	json_add_uncommitted_channel(response, peer->uncommitted_channel, peer);
-	list_for_each(&peer->channels, channel, list) {
+	list_for_each(&peer->channels, channel, list)
+	{
 		if (channel_state_uncommitted(channel->state))
 			json_add_unsaved_channel(response, channel, peer);
 		else
@@ -2247,18 +2437,16 @@ static void json_add_peerchannels(struct lightningd *ld,
 	}
 }
 
-static struct command_result *json_listpeerchannels(struct command *cmd,
-						    const char *buffer,
-						    const jsmntok_t *obj UNNEEDED,
-						    const jsmntok_t *params)
+static struct command_result *
+json_listpeerchannels(struct command *cmd, const char *buffer,
+		      const jsmntok_t *obj UNNEEDED, const jsmntok_t *params)
 {
 	struct node_id *peer_id;
 	struct peer *peer;
 	struct json_stream *response;
 
 	/* FIME: filter by status */
-	if (!param(cmd, buffer, params,
-		   p_opt("id", param_node_id, &peer_id),
+	if (!param(cmd, buffer, params, p_opt("id", param_node_id, &peer_id),
 		   NULL))
 		return command_param_failed();
 
@@ -2272,8 +2460,7 @@ static struct command_result *json_listpeerchannels(struct command *cmd,
 	} else {
 		struct peer_node_id_map_iter it;
 
-		for (peer = peer_node_id_map_first(cmd->ld->peers, &it);
-		     peer;
+		for (peer = peer_node_id_map_first(cmd->ld->peers, &it); peer;
 		     peer = peer_node_id_map_next(cmd->ld->peers, &it)) {
 			json_add_peerchannels(cmd->ld, response, peer);
 		}
@@ -2285,18 +2472,13 @@ static struct command_result *json_listpeerchannels(struct command *cmd,
 }
 
 static const struct json_command listpeerchannels_command = {
-	"listpeerchannels",
-	"network",
-	json_listpeerchannels,
-	"Show channels with direct peers."
-};
+    "listpeerchannels", "network", json_listpeerchannels,
+    "Show channels with direct peers."};
 AUTODATA(json_command, &listpeerchannels_command);
 
 struct command_result *
-command_find_channel(struct command *cmd,
-		     const char *name,
-		     const char *buffer, const jsmntok_t *tok,
-		     struct channel **channel)
+command_find_channel(struct command *cmd, const char *name, const char *buffer,
+		     const jsmntok_t *tok, struct channel **channel)
 {
 	struct lightningd *ld = cmd->ld;
 	struct channel_id cid;
@@ -2306,11 +2488,12 @@ command_find_channel(struct command *cmd,
 	if (json_tok_channel_id(buffer, tok, &cid)) {
 		struct peer_node_id_map_iter it;
 
-		for (peer = peer_node_id_map_first(ld->peers, &it);
-		     peer;
+		for (peer = peer_node_id_map_first(ld->peers, &it); peer;
 		     peer = peer_node_id_map_next(ld->peers, &it)) {
-			list_for_each(&peer->channels, (*channel), list) {
-				if (!channel_state_wants_peercomms((*channel)->state))
+			list_for_each(&peer->channels, (*channel), list)
+			{
+				if (!channel_state_wants_peercomms(
+					(*channel)->state))
 					continue;
 				if (channel_id_eq(&(*channel)->cid, &cid))
 					return NULL;
@@ -2321,12 +2504,14 @@ command_find_channel(struct command *cmd,
 	} else if (json_to_short_channel_id(buffer, tok, &scid)) {
 		*channel = any_channel_by_scid(ld, &scid, true);
 		if (!*channel)
-			return command_fail_badparam(cmd, name, buffer, tok,
-						     "Short channel id not found");
+			return command_fail_badparam(
+			    cmd, name, buffer, tok,
+			    "Short channel id not found");
 		return NULL;
 	} else {
-		return command_fail_badparam(cmd, name, buffer, tok,
-					     "should be a channel ID or short channel ID");
+		return command_fail_badparam(
+		    cmd, name, buffer, tok,
+		    "should be a channel ID or short channel ID");
 	}
 }
 
@@ -2337,7 +2522,8 @@ static void setup_peer(struct peer *peer, u32 delay)
 	struct lightningd *ld = peer->ld;
 	bool connect = false;
 
-	list_for_each(&peer->channels, channel, list) {
+	list_for_each(&peer->channels, channel, list)
+	{
 		switch (channel->state) {
 		case DUALOPEND_OPEN_INIT:
 		case DUALOPEND_OPEN_COMMIT_READY:
@@ -2362,13 +2548,13 @@ static void setup_peer(struct peer *peer, u32 delay)
 		/* We need to watch all inflights which may open channel */
 		case DUALOPEND_AWAITING_LOCKIN:
 			list_for_each(&channel->inflights, inflight, list)
-				watch_opening_inflight(ld, inflight);
+			    watch_opening_inflight(ld, inflight);
 			break;
 
 		/* We need to watch all inflights which may splice */
 		case CHANNELD_AWAITING_SPLICE:
 			list_for_each(&channel->inflights, inflight, list)
-				watch_splice_inflight(ld, inflight);
+			    watch_splice_inflight(ld, inflight);
 			break;
 		}
 
@@ -2394,8 +2580,7 @@ void setup_peers(struct lightningd *ld)
 	int delay = -5;
 	struct peer_node_id_map_iter it;
 
-	for (p = peer_node_id_map_first(ld->peers, &it);
-	     p;
+	for (p = peer_node_id_map_first(ld->peers, &it); p;
 	     p = peer_node_id_map_next(ld->peers, &it)) {
 		setup_peer(p, delay > 0 ? delay : 0);
 		delay++;
@@ -2414,15 +2599,14 @@ struct htlc_in_map *load_channels_from_wallet(struct lightningd *ld)
 		fatal("Could not load channels from the database");
 
 	/* First we load the incoming htlcs */
-	for (peer = peer_node_id_map_first(ld->peers, &it);
-	     peer;
+	for (peer = peer_node_id_map_first(ld->peers, &it); peer;
 	     peer = peer_node_id_map_next(ld->peers, &it)) {
 		struct channel *channel;
 
-		list_for_each(&peer->channels, channel, list) {
-			if (!wallet_htlcs_load_in_for_channel(ld->wallet,
-							      channel,
-							      ld->htlcs_in)) {
+		list_for_each(&peer->channels, channel, list)
+		{
+			if (!wallet_htlcs_load_in_for_channel(
+				ld->wallet, channel, ld->htlcs_in)) {
 				fatal("could not load htlcs for channel");
 			}
 		}
@@ -2432,17 +2616,17 @@ struct htlc_in_map *load_channels_from_wallet(struct lightningd *ld)
 	htlc_in_map_copy(unconnected_htlcs_in, ld->htlcs_in);
 
 	/* Now we load the outgoing HTLCs, so we can connect them. */
-	for (peer = peer_node_id_map_first(ld->peers, &it);
-	     peer;
+	for (peer = peer_node_id_map_first(ld->peers, &it); peer;
 	     peer = peer_node_id_map_next(ld->peers, &it)) {
 		struct channel *channel;
 
-		list_for_each(&peer->channels, channel, list) {
-			if (!wallet_htlcs_load_out_for_channel(ld->wallet,
-							       channel,
-							       ld->htlcs_out,
-							       unconnected_htlcs_in)) {
-				fatal("could not load outgoing htlcs for channel");
+		list_for_each(&peer->channels, channel, list)
+		{
+			if (!wallet_htlcs_load_out_for_channel(
+				ld->wallet, channel, ld->htlcs_out,
+				unconnected_htlcs_in)) {
+				fatal("could not load outgoing htlcs for "
+				      "channel");
 			}
 		}
 	}
@@ -2454,8 +2638,7 @@ struct htlc_in_map *load_channels_from_wallet(struct lightningd *ld)
 	return unconnected_htlcs_in;
 }
 
-static struct command_result *param_peer(struct command *cmd,
-					 const char *name,
+static struct command_result *param_peer(struct command *cmd, const char *name,
 					 const char *buffer,
 					 const jsmntok_t *tok,
 					 struct peer **peer)
@@ -2469,8 +2652,7 @@ static struct command_result *param_peer(struct command *cmd,
 	if (!*peer)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "Unknown peer '%.*s'",
-				    tok->end - tok->start,
-				    buffer + tok->start);
+				    tok->end - tok->start, buffer + tok->start);
 	return NULL;
 }
 
@@ -2484,10 +2666,8 @@ static struct command_result *json_disconnect(struct command *cmd,
 	struct channel *channel;
 	bool *force;
 
-	if (!param_check(cmd, buffer, params,
-			 p_req("id", param_peer, &peer),
-			 p_opt_def("force", param_bool, &force, false),
-			 NULL))
+	if (!param_check(cmd, buffer, params, p_req("id", param_peer, &peer),
+			 p_opt_def("force", param_bool, &force, false), NULL))
 		return command_param_failed();
 
 	if (peer->connected == PEER_DISCONNECTED) {
@@ -2496,9 +2676,10 @@ static struct command_result *json_disconnect(struct command *cmd,
 
 	channel = peer_any_channel(peer, channel_state_wants_peercomms, NULL);
 	if (channel && !*force) {
-		return command_fail(cmd, LIGHTNINGD,
-				    "Peer has (at least one) channel in state %s",
-				    channel_state_name(channel));
+		return command_fail(
+		    cmd, LIGHTNINGD,
+		    "Peer has (at least one) channel in state %s",
+		    channel_state_name(channel));
 	}
 
 	if (command_check_only(cmd))
@@ -2517,11 +2698,9 @@ static struct command_result *json_disconnect(struct command *cmd,
 }
 
 static const struct json_command disconnect_command = {
-	"disconnect",
-	"network",
-	json_disconnect,
-	"Disconnect from {id} that has previously been connected to using connect; with {force} set, even if it has a current channel"
-};
+    "disconnect", "network", json_disconnect,
+    "Disconnect from {id} that has previously been connected to using connect; "
+    "with {force} set, even if it has a current channel"};
 AUTODATA(json_command, &disconnect_command);
 
 static struct command_result *json_getinfo(struct command *cmd,
@@ -2546,12 +2725,12 @@ static struct command_result *json_getinfo(struct command *cmd,
 	json_add_hex_talarr(response, "color", cmd->ld->rgb);
 
 	/* Add some peer and channel stats */
-	for (peer = peer_node_id_map_first(cmd->ld->peers, &it);
-	     peer;
+	for (peer = peer_node_id_map_first(cmd->ld->peers, &it); peer;
 	     peer = peer_node_id_map_next(cmd->ld->peers, &it)) {
 		num_peers++;
 
-		list_for_each(&peer->channels, channel, list) {
+		list_for_each(&peer->channels, channel, list)
+		{
 			switch (channel->state) {
 			case CHANNELD_AWAITING_LOCKIN:
 			case DUALOPEND_OPEN_INIT:
@@ -2588,22 +2767,23 @@ static struct command_result *json_getinfo(struct command *cmd,
 		/* These are the addresses we're announcing */
 		count_announceable = tal_count(cmd->ld->announceable);
 		for (size_t i = 0; i < count_announceable; i++)
-			json_add_address(response, NULL, cmd->ld->announceable+i);
+			json_add_address(response, NULL,
+					 cmd->ld->announceable + i);
 
 		/* Add discovered IPs if we announce them.
-		 * Also see `create_node_announcement` in `gossip_generation.c`. */
-		if ((cmd->ld->config.ip_discovery == OPT_AUTOBOOL_AUTO && count_announceable == 0) ||
-		     cmd->ld->config.ip_discovery == OPT_AUTOBOOL_TRUE) {
+		 * Also see `create_node_announcement` in `gossip_generation.c`.
+		 */
+		if ((cmd->ld->config.ip_discovery == OPT_AUTOBOOL_AUTO &&
+		     count_announceable == 0) ||
+		    cmd->ld->config.ip_discovery == OPT_AUTOBOOL_TRUE) {
 			if (cmd->ld->discovered_ip_v4 != NULL &&
-					!wireaddr_arr_contains(
-						cmd->ld->announceable,
-						cmd->ld->discovered_ip_v4))
+			    !wireaddr_arr_contains(cmd->ld->announceable,
+						   cmd->ld->discovered_ip_v4))
 				json_add_address(response, NULL,
 						 cmd->ld->discovered_ip_v4);
 			if (cmd->ld->discovered_ip_v6 != NULL &&
-					!wireaddr_arr_contains(
-						cmd->ld->announceable,
-						cmd->ld->discovered_ip_v6))
+			    !wireaddr_arr_contains(cmd->ld->announceable,
+						   cmd->ld->discovered_ip_v6))
 				json_add_address(response, NULL,
 						 cmd->ld->discovered_ip_v6);
 		}
@@ -2613,7 +2793,7 @@ static struct command_result *json_getinfo(struct command *cmd,
 		json_array_start(response, "binding");
 		for (size_t i = 0; i < tal_count(cmd->ld->binding); i++)
 			json_add_address_internal(response, NULL,
-					cmd->ld->binding+i);
+						  cmd->ld->binding + i);
 	}
 	json_array_end(response);
 
@@ -2629,8 +2809,7 @@ static struct command_result *json_getinfo(struct command *cmd,
 			     cmd->ld->gossip_blockheight);
 	}
 	json_add_string(response, "network", chainparams->network_name);
-	json_add_amount_msat(response,
-			     "fees_collected_msat",
+	json_add_amount_msat(response, "fees_collected_msat",
 			     wallet_total_forward_fees(cmd->ld->wallet));
 	json_add_string(response, "lightning-dir", cmd->ld->config_netdir);
 
@@ -2643,10 +2822,9 @@ static struct command_result *json_getinfo(struct command *cmd,
 
 	u8 **bits = cmd->ld->our_features->bits;
 	json_object_start(response, "our_features");
-	json_add_hex_talarr(response, "init",
-			featurebits_or(cmd,
-				       bits[INIT_FEATURE],
-				       bits[GLOBAL_INIT_FEATURE]));
+	json_add_hex_talarr(
+	    response, "init",
+	    featurebits_or(cmd, bits[INIT_FEATURE], bits[GLOBAL_INIT_FEATURE]));
 	json_add_hex_talarr(response, "node", bits[NODE_ANNOUNCE_FEATURE]);
 	json_add_hex_talarr(response, "channel", bits[CHANNEL_FEATURE]);
 	json_add_hex_talarr(response, "invoice", bits[BOLT11_FEATURE]);
@@ -2656,11 +2834,7 @@ static struct command_result *json_getinfo(struct command *cmd,
 }
 
 static const struct json_command getinfo_command = {
-    "getinfo",
-	"utility",
-    json_getinfo,
-    "Show information about this node"
-};
+    "getinfo", "utility", json_getinfo, "Show information about this node"};
 AUTODATA(json_command, &getinfo_command);
 
 /* Wait for at least a specific blockheight, then return, or time out.  */
@@ -2675,9 +2849,8 @@ struct waitblockheight_waiter {
 	bool removed;
 };
 /* Completes a pending waitblockheight.  */
-static struct command_result *
-waitblockheight_complete(struct command *cmd,
-			 u32 block_height)
+static struct command_result *waitblockheight_complete(struct command *cmd,
+						       u32 block_height)
 {
 	struct json_stream *response;
 
@@ -2686,25 +2859,21 @@ waitblockheight_complete(struct command *cmd,
 	return command_success(cmd, response);
 }
 /* Called when command is destroyed without being resolved.  */
-static void
-destroy_waitblockheight_waiter(struct waitblockheight_waiter *w)
+static void destroy_waitblockheight_waiter(struct waitblockheight_waiter *w)
 {
 	if (!w->removed)
 		list_del(&w->list);
 }
 /* Called on timeout.  */
-static void
-timeout_waitblockheight_waiter(struct waitblockheight_waiter *w)
+static void timeout_waitblockheight_waiter(struct waitblockheight_waiter *w)
 {
 	list_del(&w->list);
 	w->removed = true;
 	tal_steal(tmpctx, w);
-	was_pending(command_fail(w->cmd, WAIT_TIMEOUT,
-				 "Timed out."));
+	was_pending(command_fail(w->cmd, WAIT_TIMEOUT, "Timed out."));
 }
 /* Called by lightningd at each new block.  */
-void waitblockheight_notify_new_block(struct lightningd *ld,
-				      u32 block_height)
+void waitblockheight_notify_new_block(struct lightningd *ld, u32 block_height)
 {
 	struct waitblockheight_waiter *w, *n;
 	char *to_delete = tal(NULL, char);
@@ -2712,7 +2881,8 @@ void waitblockheight_notify_new_block(struct lightningd *ld,
 	/* Use safe since we could resolve commands and thus
 	 * trigger removal of list elements.
 	 */
-	list_for_each_safe(&ld->waitblockheight_commands, w, n, list) {
+	list_for_each_safe(&ld->waitblockheight_commands, w, n, list)
+	{
 		/* Skip commands that have not been reached yet.  */
 		if (w->block_height > block_height)
 			continue;
@@ -2720,8 +2890,7 @@ void waitblockheight_notify_new_block(struct lightningd *ld,
 		list_del(&w->list);
 		w->removed = true;
 		tal_steal(to_delete, w);
-		was_pending(waitblockheight_complete(w->cmd,
-						     block_height));
+		was_pending(waitblockheight_complete(w->cmd, block_height));
 	}
 	tal_free(to_delete);
 }
@@ -2737,8 +2906,7 @@ static struct command_result *json_waitblockheight(struct command *cmd,
 
 	if (!param(cmd, buffer, params,
 		   p_req("blockheight", param_number, &target_block_height),
-		   p_opt_def("timeout", param_number, &timeout, 60),
-		   NULL))
+		   p_opt_def("timeout", param_number, &timeout, 60), NULL))
 		return command_param_failed();
 
 	/* Check if already reached anyway.  */
@@ -2754,19 +2922,16 @@ static struct command_result *json_waitblockheight(struct command *cmd,
 	w->block_height = *target_block_height;
 	w->removed = false;
 	/* Install the timeout.  */
-	(void) new_reltimer(cmd->ld->timers, w, time_from_sec(*timeout),
-			    &timeout_waitblockheight_waiter, w);
+	(void)new_reltimer(cmd->ld->timers, w, time_from_sec(*timeout),
+			   &timeout_waitblockheight_waiter, w);
 
 	return command_still_pending(cmd);
 }
 
 static const struct json_command waitblockheight_command = {
-	"waitblockheight",
-	"utility",
-	&json_waitblockheight,
-	"Wait for the blockchain to reach {blockheight}, up to "
-	"{timeout} seconds."
-};
+    "waitblockheight", "utility", &json_waitblockheight,
+    "Wait for the blockchain to reach {blockheight}, up to "
+    "{timeout} seconds."};
 AUTODATA(json_command, &waitblockheight_command);
 
 static bool channel_state_can_setchannel(enum channel_state state)
@@ -2792,11 +2957,9 @@ static bool channel_state_can_setchannel(enum channel_state state)
 	abort();
 }
 
-static struct command_result *param_channel_or_all(struct command *cmd,
-					     const char *name,
-					     const char *buffer,
-					     const jsmntok_t *tok,
-					     struct channel ***channels)
+static struct command_result *
+param_channel_or_all(struct command *cmd, const char *name, const char *buffer,
+		     const jsmntok_t *tok, struct channel ***channels)
 {
 	struct command_result *res;
 	struct peer *peer;
@@ -2813,13 +2976,15 @@ static struct command_result *param_channel_or_all(struct command *cmd,
 	/* Find channels by peer_id */
 	peer = peer_from_json(cmd->ld, buffer, tok);
 	if (peer) {
-		list_for_each(&peer->channels, channel, list) {
+		list_for_each(&peer->channels, channel, list)
+		{
 			if (channel_state_can_setchannel(channel->state))
 				tal_arr_expand(channels, channel);
 		}
 		if (tal_count(*channels) == 0)
 			return command_fail(cmd, LIGHTNINGD,
-					    "Could not find any active channels of peer with that id");
+					    "Could not find any active "
+					    "channels of peer with that id");
 		return NULL;
 	}
 
@@ -2829,9 +2994,10 @@ static struct command_result *param_channel_or_all(struct command *cmd,
 		return res;
 	/* check channel is found and in valid state */
 	if (!channel_state_can_setchannel(channel->state))
-		return command_fail_badparam(cmd, name, buffer, tok,
-					     tal_fmt(tmpctx, "Channel in state %s",
-						     channel_state_name(channel)));
+		return command_fail_badparam(
+		    cmd, name, buffer, tok,
+		    tal_fmt(tmpctx, "Channel in state %s",
+			    channel_state_name(channel)));
 	tal_arr_expand(channels, channel);
 	return NULL;
 }
@@ -2841,8 +3007,7 @@ static struct command_result *param_channel_or_all(struct command *cmd,
 static struct command_result *param_msat_u32(struct command *cmd,
 					     const char *name,
 					     const char *buffer,
-					     const jsmntok_t *tok,
-					     u32 **num)
+					     const jsmntok_t *tok, u32 **num)
 {
 	struct amount_msat *msat;
 	struct command_result *res;
@@ -2862,11 +3027,9 @@ static struct command_result *param_msat_u32(struct command *cmd,
 }
 
 static void set_channel_config(struct command *cmd, struct channel *channel,
-			       u32 *base,
-			       u32 *ppm,
+			       u32 *base, u32 *ppm,
 			       struct amount_msat *htlc_min,
-			       struct amount_msat *htlc_max,
-			       u32 delaysecs,
+			       struct amount_msat *htlc_max, u32 delaysecs,
 			       bool *ignore_fee_limits,
 			       struct json_stream *response)
 {
@@ -2874,14 +3037,14 @@ static void set_channel_config(struct command *cmd, struct channel *channel,
 
 	/* We only need to defer values if we *increase* fees (or drop
 	 * max, increase min); we always allow users to overpay fees. */
-	if ((base && *base > channel->feerate_base)
-	    || (ppm && *ppm > channel->feerate_ppm)
-	    || (htlc_min
-		&& amount_msat_greater(*htlc_min, channel->htlc_minimum_msat))
-	    || (htlc_max
-		&& amount_msat_less(*htlc_max, channel->htlc_maximum_msat))) {
-		channel->old_feerate_timeout
-			= timeabs_add(time_now(), time_from_sec(delaysecs));
+	if ((base && *base > channel->feerate_base) ||
+	    (ppm && *ppm > channel->feerate_ppm) ||
+	    (htlc_min &&
+	     amount_msat_greater(*htlc_min, channel->htlc_minimum_msat)) ||
+	    (htlc_max &&
+	     amount_msat_less(*htlc_max, channel->htlc_maximum_msat))) {
+		channel->old_feerate_timeout =
+		    timeabs_add(time_now(), time_from_sec(delaysecs));
 		channel->old_feerate_base = channel->feerate_base;
 		channel->old_feerate_ppm = channel->feerate_ppm;
 		channel->old_htlc_minimum_msat = channel->htlc_minimum_msat;
@@ -2919,9 +3082,8 @@ static void set_channel_config(struct command *cmd, struct channel *channel,
 		channel->ignore_fee_limits = *ignore_fee_limits;
 
 	/* Tell channeld about the new acceptable feerates */
-	if (channel->owner
-	    && streq(channel->owner->name, "channeld")
-	    && ignore_fee_limits) {
+	if (channel->owner && streq(channel->owner->name, "channeld") &&
+	    ignore_fee_limits) {
 		channel_update_feerates(cmd->ld, channel);
 	}
 
@@ -2935,28 +3097,31 @@ static void set_channel_config(struct command *cmd, struct channel *channel,
 	/* write JSON response entry */
 	json_object_start(response, NULL);
 	json_add_node_id(response, "peer_id", &channel->peer->id);
-	json_add_string(response, "channel_id",
-			type_to_string(tmpctx, struct channel_id, &channel->cid));
+	json_add_string(
+	    response, "channel_id",
+	    type_to_string(tmpctx, struct channel_id, &channel->cid));
 	if (channel->scid)
-		json_add_short_channel_id(response, "short_channel_id", channel->scid);
+		json_add_short_channel_id(response, "short_channel_id",
+					  channel->scid);
 
 	json_add_amount_msat(response, "fee_base_msat",
 			     amount_msat(channel->feerate_base));
 	json_add_u32(response, "fee_proportional_millionths",
 		     channel->feerate_ppm);
-	json_add_amount_msat(response,
-			     "minimum_htlc_out_msat",
+	json_add_amount_msat(response, "minimum_htlc_out_msat",
 			     channel->htlc_minimum_msat);
 	if (warn_cannot_set_min)
-		json_add_string(response, "warning_htlcmin_too_low",
-				"Set minimum_htlc_out_msat to minimum allowed by peer");
-	json_add_amount_msat(response,
-			     "maximum_htlc_out_msat",
+		json_add_string(
+		    response, "warning_htlcmin_too_low",
+		    "Set minimum_htlc_out_msat to minimum allowed by peer");
+	json_add_amount_msat(response, "maximum_htlc_out_msat",
 			     channel->htlc_maximum_msat);
-	json_add_bool(response, "ignore_fee_limits", channel->ignore_fee_limits);
+	json_add_bool(response, "ignore_fee_limits",
+		      channel->ignore_fee_limits);
 	if (warn_cannot_set_max)
-		json_add_string(response, "warning_htlcmax_too_high",
-				"Set maximum_htlc_out_msat to maximum possible in channel");
+		json_add_string(
+		    response, "warning_htlcmax_too_high",
+		    "Set maximum_htlc_out_msat to maximum possible in channel");
 	json_object_end(response);
 }
 
@@ -2973,20 +3138,19 @@ static struct command_result *json_setchannel(struct command *cmd,
 	bool *ignore_fee_limits;
 
 	/* Parse the JSON command */
-	if (!param_check(cmd, buffer, params,
-			 p_req("id", param_channel_or_all, &channels),
-			 p_opt("feebase", param_msat_u32, &base),
-			 p_opt("feeppm", param_number, &ppm),
-			 p_opt("htlcmin", param_msat, &htlc_min),
-			 p_opt("htlcmax", param_msat, &htlc_max),
-			 p_opt_def("enforcedelay", param_number, &delaysecs, 600),
-			 p_opt("ignorefeelimits", param_bool, &ignore_fee_limits),
-			 NULL))
+	if (!param_check(
+		cmd, buffer, params,
+		p_req("id", param_channel_or_all, &channels),
+		p_opt("feebase", param_msat_u32, &base),
+		p_opt("feeppm", param_number, &ppm),
+		p_opt("htlcmin", param_msat, &htlc_min),
+		p_opt("htlcmax", param_msat, &htlc_max),
+		p_opt_def("enforcedelay", param_number, &delaysecs, 600),
+		p_opt("ignorefeelimits", param_bool, &ignore_fee_limits), NULL))
 		return command_param_failed();
 
 	/* Prevent obviously incorrect things! */
-	if (htlc_min && htlc_max
-	    && amount_msat_less(*htlc_max, *htlc_min)) {
+	if (htlc_min && htlc_max && amount_msat_less(*htlc_max, *htlc_min)) {
 		return command_fail(cmd, LIGHTNINGD,
 				    "htlcmax cannot be less than htlcmin");
 	}
@@ -3002,26 +3166,25 @@ static struct command_result *json_setchannel(struct command *cmd,
 	if (channels == NULL) {
 		struct peer_node_id_map_iter it;
 
-		for (peer = peer_node_id_map_first(cmd->ld->peers, &it);
-		     peer;
+		for (peer = peer_node_id_map_first(cmd->ld->peers, &it); peer;
 		     peer = peer_node_id_map_next(cmd->ld->peers, &it)) {
 			struct channel *channel;
-			list_for_each(&peer->channels, channel, list) {
-				if (!channel_state_can_setchannel(channel->state))
+			list_for_each(&peer->channels, channel, list)
+			{
+				if (!channel_state_can_setchannel(
+					channel->state))
 					continue;
-				set_channel_config(cmd, channel, base, ppm,
-						   htlc_min, htlc_max,
-						   *delaysecs, ignore_fee_limits,
-						   response);
+				set_channel_config(
+				    cmd, channel, base, ppm, htlc_min, htlc_max,
+				    *delaysecs, ignore_fee_limits, response);
 			}
 		}
-	/* single peer should be updated */
+		/* single peer should be updated */
 	} else {
 		for (size_t i = 0; i < tal_count(channels); i++) {
 			set_channel_config(cmd, channels[i], base, ppm,
-					   htlc_min, htlc_max,
-					   *delaysecs, ignore_fee_limits,
-					   response);
+					   htlc_min, htlc_max, *delaysecs,
+					   ignore_fee_limits, response);
 		}
 	}
 
@@ -3031,23 +3194,19 @@ static struct command_result *json_setchannel(struct command *cmd,
 }
 
 static const struct json_command setchannel_command = {
-	"setchannel",
-	"channels",
-	json_setchannel,
-	"Sets fees and/or htlc_max for channel with {id} "
-	"(either peer ID, channel ID, short channel ID or 'all'). "
-	"If {feebase}, {feeppm} or {htlcmax} is missing, it is unchanged."
-	"{base} can also be defined in other units, for example '1sat'. "
-	"If {id} is 'all', the fees will be applied for all channels. "
-};
+    "setchannel", "channels", json_setchannel,
+    "Sets fees and/or htlc_max for channel with {id} "
+    "(either peer ID, channel ID, short channel ID or 'all'). "
+    "If {feebase}, {feeppm} or {htlcmax} is missing, it is unchanged."
+    "{base} can also be defined in other units, for example '1sat'. "
+    "If {id} is 'all', the fees will be applied for all channels. "};
 AUTODATA(json_command, &setchannel_command);
 
-/* dev hack, don't use for real interfaces, which have to handle channel ids, or multiple channels */
-static struct command_result *param_dev_channel(struct command *cmd,
-						const char *name,
-						const char *buffer,
-						const jsmntok_t *tok,
-						struct channel **channel)
+/* dev hack, don't use for real interfaces, which have to handle channel ids, or
+ * multiple channels */
+static struct command_result *
+param_dev_channel(struct command *cmd, const char *name, const char *buffer,
+		  const jsmntok_t *tok, struct channel **channel)
 {
 	struct peer *peer;
 	struct command_result *res;
@@ -3057,14 +3216,16 @@ static struct command_result *param_dev_channel(struct command *cmd,
 	if (res)
 		return res;
 
-	*channel = peer_any_channel(peer, channel_state_wants_peercomms, &more_than_one);
+	*channel = peer_any_channel(peer, channel_state_wants_peercomms,
+				    &more_than_one);
 	if (!*channel)
 		return command_fail_badparam(cmd, name, buffer, tok,
 					     "No channel with that peer");
 
 	if (more_than_one)
-		return command_fail_badparam(cmd, name, buffer, tok,
-					     "More than one channel with that peer");
+		return command_fail_badparam(
+		    cmd, name, buffer, tok,
+		    "More than one channel with that peer");
 
 	return NULL;
 }
@@ -3079,8 +3240,7 @@ static struct command_result *json_sign_last_tx(struct command *cmd,
 	struct bitcoin_tx *tx;
 
 	if (!param(cmd, buffer, params,
-		   p_req("id", param_dev_channel, &channel),
-		   NULL))
+		   p_req("id", param_dev_channel, &channel), NULL))
 		return command_param_failed();
 
 	response = json_stream_success(cmd);
@@ -3095,7 +3255,8 @@ static struct command_result *json_sign_last_tx(struct command *cmd,
 		struct channel_inflight *inflight;
 
 		json_array_start(response, "inflights");
-		list_for_each(&channel->inflights, inflight, list) {
+		list_for_each(&channel->inflights, inflight, list)
+		{
 			tx = sign_last_tx(cmd, channel, inflight->last_tx,
 					  &inflight->last_sig);
 			json_object_start(response, NULL);
@@ -3111,11 +3272,11 @@ static struct command_result *json_sign_last_tx(struct command *cmd,
 }
 
 static const struct json_command dev_sign_last_tx = {
-	"dev-sign-last-tx",
-	"developer",
-	json_sign_last_tx,
-	"Sign and show the last commitment transaction with peer {id}",
-	.dev_only = true,
+    "dev-sign-last-tx",
+    "developer",
+    json_sign_last_tx,
+    "Sign and show the last commitment transaction with peer {id}",
+    .dev_only = true,
 };
 AUTODATA(json_command, &dev_sign_last_tx);
 
@@ -3127,22 +3288,17 @@ static struct command_result *json_dev_fail(struct command *cmd,
 	struct channel *channel;
 
 	if (!param(cmd, buffer, params,
-		   p_req("id", param_dev_channel, &channel),
-		   NULL))
+		   p_req("id", param_dev_channel, &channel), NULL))
 		return command_param_failed();
 
-	channel_fail_permanent(channel,
-			       REASON_USER,
+	channel_fail_permanent(channel, REASON_USER,
 			       "Failing due to dev-fail command");
 	return command_success(cmd, json_stream_success(cmd));
 }
 
 static const struct json_command dev_fail_command = {
-	"dev-fail",
-	"developer",
-	json_dev_fail,
-	"Fail with peer {id}",
-	.dev_only = true,
+    "dev-fail",	      "developer", json_dev_fail, "Fail with peer {id}",
+    .dev_only = true,
 };
 AUTODATA(json_command, &dev_fail_command);
 
@@ -3154,27 +3310,25 @@ static void dev_reenable_commit_finished(struct subd *channeld UNUSED,
 	was_pending(command_success(cmd, json_stream_success(cmd)));
 }
 
-static struct command_result *json_dev_reenable_commit(struct command *cmd,
-						       const char *buffer,
-						       const jsmntok_t *obj UNNEEDED,
-						       const jsmntok_t *params)
+static struct command_result *
+json_dev_reenable_commit(struct command *cmd, const char *buffer,
+			 const jsmntok_t *obj UNNEEDED, const jsmntok_t *params)
 {
 	u8 *msg;
 	struct channel *channel;
 
 	if (!param_check(cmd, buffer, params,
-			 p_req("id", param_dev_channel, &channel),
-			 NULL))
+			 p_req("id", param_dev_channel, &channel), NULL))
 		return command_param_failed();
 
 	if (!channel->owner) {
-		return command_fail(cmd, LIGHTNINGD,
-				    "Peer has no owner");
+		return command_fail(cmd, LIGHTNINGD, "Peer has no owner");
 	}
 
-	if (!streq(channel->owner->name, "channeld")) {
-		return command_fail(cmd, LIGHTNINGD,
-				    "Peer owned by %s", channel->owner->name);
+	if (!streq(channel->owner->name, "channeld") &&
+	    !streq(channel->owner->name, "eltoo_channeld")) {
+		return command_fail(cmd, LIGHTNINGD, "Peer owned by %s",
+				    channel->owner->name);
 	}
 
 	if (command_check_only(cmd))
@@ -3187,11 +3341,9 @@ static struct command_result *json_dev_reenable_commit(struct command *cmd,
 }
 
 static const struct json_command dev_reenable_commit = {
-	"dev-reenable-commit",
-	"developer",
-	json_dev_reenable_commit,
-	"Re-enable the commit timer on peer {id}",
-	.dev_only = true,
+    "dev-reenable-commit",    "developer",
+    json_dev_reenable_commit, "Re-enable the commit timer on peer {id}",
+    .dev_only = true,
 };
 AUTODATA(json_command, &dev_reenable_commit);
 
@@ -3209,14 +3361,15 @@ static void process_dev_forget_channel(struct bitcoind *bitcoind UNUSED,
 	struct json_stream *response;
 	struct dev_forget_channel_cmd *forget = arg;
 	if (txout != NULL && !forget->force) {
-		was_pending(command_fail(forget->cmd, LIGHTNINGD,
-			     "Cowardly refusing to forget channel with an "
-			     "unspent funding output, if you know what "
-			     "you're doing you can override with "
-			     "`force=true`, otherwise consider `close` or "
-			     "`dev-fail`! If you force and the channel "
-			     "confirms we will not track the funds in the "
-			     "channel"));
+		was_pending(
+		    command_fail(forget->cmd, LIGHTNINGD,
+				 "Cowardly refusing to forget channel with an "
+				 "unspent funding output, if you know what "
+				 "you're doing you can override with "
+				 "`force=true`, otherwise consider `close` or "
+				 "`dev-fail`! If you force and the channel "
+				 "confirms we will not track the funds in the "
+				 "channel"));
 		return;
 	}
 	response = json_stream_success(forget->cmd);
@@ -3225,18 +3378,16 @@ static void process_dev_forget_channel(struct bitcoind *bitcoind UNUSED,
 	json_add_txid(response, "funding_txid", &forget->channel->funding.txid);
 
 	/* Set error so we don't try to reconnect. */
-	forget->channel->error = towire_errorfmt(forget->channel,
-						 &forget->channel->cid,
-						 "dev_forget_channel");
+	forget->channel->error = towire_errorfmt(
+	    forget->channel, &forget->channel->cid, "dev_forget_channel");
 	delete_channel(forget->channel);
 
 	was_pending(command_success(forget->cmd, response));
 }
 
-static struct command_result *json_dev_forget_channel(struct command *cmd,
-						      const char *buffer,
-						      const jsmntok_t *obj UNNEEDED,
-						      const jsmntok_t *params)
+static struct command_result *
+json_dev_forget_channel(struct command *cmd, const char *buffer,
+			const jsmntok_t *obj UNNEEDED, const jsmntok_t *params)
 {
 	struct peer *peer;
 	struct channel *channel;
@@ -3245,12 +3396,11 @@ static struct command_result *json_dev_forget_channel(struct command *cmd,
 	struct dev_forget_channel_cmd *forget;
 	bool *force;
 
-	if (!param_check(cmd, buffer, params,
-			 p_req("id", param_peer, &peer),
-			 p_opt("short_channel_id", param_short_channel_id, &scid),
-			 p_opt("channel_id", param_channel_id, &find_cid),
-			 p_opt_def("force", param_bool, &force, false),
-			 NULL))
+	if (!param_check(
+		cmd, buffer, params, p_req("id", param_peer, &peer),
+		p_opt("short_channel_id", param_short_channel_id, &scid),
+		p_opt("channel_id", param_channel_id, &find_cid),
+		p_opt_def("force", param_bool, &force, false), NULL))
 		return command_param_failed();
 
 	forget = tal(cmd, struct dev_forget_channel_cmd);
@@ -3258,7 +3408,8 @@ static struct command_result *json_dev_forget_channel(struct command *cmd,
 	forget->force = *force;
 
 	forget->channel = NULL;
-	list_for_each(&peer->channels, channel, list) {
+	list_for_each(&peer->channels, channel, list)
+	{
 		/* Check for channel id first */
 		if (find_cid) {
 			if (!channel_id_eq(find_cid, &channel->cid))
@@ -3280,7 +3431,7 @@ static struct command_result *json_dev_forget_channel(struct command *cmd,
 	if (!forget->channel) {
 		return command_fail(cmd, LIGHTNINGD,
 				    "No channels matching that peer_id%s",
-					scid ? " and that short_channel_id" : "");
+				    scid ? " and that short_channel_id" : "");
 	}
 
 	if (channel_has_htlc_out(forget->channel) ||
@@ -3302,17 +3453,19 @@ static struct command_result *json_dev_forget_channel(struct command *cmd,
 }
 
 static const struct json_command dev_forget_channel_command = {
-	"dev-forget-channel",
-	"developer",
-	json_dev_forget_channel,
-	"Forget the channel with peer {id}, ignore UTXO check with {force}='true'.",
-	.verbose = "Forget the channel with peer {id}. Checks if the channel is still active by checking its funding transaction. Check can be ignored by setting {force} to 'true'",
-	.dev_only = true,
+    "dev-forget-channel",
+    "developer",
+    json_dev_forget_channel,
+    "Forget the channel with peer {id}, ignore UTXO check with {force}='true'.",
+    .verbose = "Forget the channel with peer {id}. Checks if the channel is "
+	       "still active by checking its funding transaction. Check can be "
+	       "ignored by setting {force} to 'true'",
+    .dev_only = true,
 };
 AUTODATA(json_command, &dev_forget_channel_command);
 
-static void channeld_memleak_req_done(struct subd *channeld,
-				      const u8 *msg, const int *fds UNUSED,
+static void channeld_memleak_req_done(struct subd *channeld, const u8 *msg,
+				      const int *fds UNUSED,
 				      struct leak_detect *leaks)
 {
 	bool found_leak;
@@ -3324,8 +3477,8 @@ static void channeld_memleak_req_done(struct subd *channeld,
 		report_subd_memleak(leaks, channeld);
 }
 
-static void onchaind_memleak_req_done(struct subd *onchaind,
-				      const u8 *msg, const int *fds UNUSED,
+static void onchaind_memleak_req_done(struct subd *onchaind, const u8 *msg,
+				      const int *fds UNUSED,
 				      struct leak_detect *leaks)
 {
 	bool found_leak;
@@ -3337,9 +3490,9 @@ static void onchaind_memleak_req_done(struct subd *onchaind,
 		report_subd_memleak(leaks, onchaind);
 }
 
-static void openingd_memleak_req_done(struct subd *open_daemon,
-				     const u8 *msg, const int *fds UNUSED,
-				     struct leak_detect *leaks)
+static void openingd_memleak_req_done(struct subd *open_daemon, const u8 *msg,
+				      const int *fds UNUSED,
+				      struct leak_detect *leaks)
 {
 	bool found_leak;
 
@@ -3350,9 +3503,9 @@ static void openingd_memleak_req_done(struct subd *open_daemon,
 		report_subd_memleak(leaks, open_daemon);
 }
 
-static void dualopend_memleak_req_done(struct subd *dualopend,
-				     const u8 *msg, const int *fds UNUSED,
-				     struct leak_detect *leaks)
+static void dualopend_memleak_req_done(struct subd *dualopend, const u8 *msg,
+				       const int *fds UNUSED,
+				       struct leak_detect *leaks)
 {
 	bool found_leak;
 
@@ -3368,36 +3521,48 @@ void peer_dev_memleak(struct lightningd *ld, struct leak_detect *leaks)
 	struct peer *p;
 	struct peer_node_id_map_iter it;
 
-	for (p = peer_node_id_map_first(ld->peers, &it);
-	     p;
+	for (p = peer_node_id_map_first(ld->peers, &it); p;
 	     p = peer_node_id_map_next(ld->peers, &it)) {
 		struct channel *c;
-		if (p->uncommitted_channel && p->uncommitted_channel->open_daemon) {
-			struct subd *openingd = p->uncommitted_channel->open_daemon;
-			start_leak_request(subd_req(openingd, openingd,
-						    take(towire_openingd_dev_memleak(NULL)),
-						    -1, 0, openingd_memleak_req_done, leaks),
-					   leaks);
+		if (p->uncommitted_channel &&
+		    p->uncommitted_channel->open_daemon) {
+			struct subd *openingd =
+			    p->uncommitted_channel->open_daemon;
+			start_leak_request(
+			    subd_req(openingd, openingd,
+				     take(towire_openingd_dev_memleak(NULL)),
+				     -1, 0, openingd_memleak_req_done, leaks),
+			    leaks);
 		}
 
-		list_for_each(&p->channels, c, list) {
+		list_for_each(&p->channels, c, list)
+		{
 			if (!c->owner)
 				continue;
 			if (streq(c->owner->name, "channeld")) {
-				start_leak_request(subd_req(c, c->owner,
-					 take(towire_channeld_dev_memleak(NULL)),
-					 -1, 0, channeld_memleak_req_done, leaks),
-					leaks);
+				start_leak_request(
+				    subd_req(
+					c, c->owner,
+					take(towire_channeld_dev_memleak(NULL)),
+					-1, 0, channeld_memleak_req_done,
+					leaks),
+				    leaks);
 			} else if (streq(c->owner->name, "onchaind")) {
-				start_leak_request(subd_req(c, c->owner,
-					 take(towire_onchaind_dev_memleak(NULL)),
-					 -1, 0, onchaind_memleak_req_done, leaks),
-					leaks);
+				start_leak_request(
+				    subd_req(
+					c, c->owner,
+					take(towire_onchaind_dev_memleak(NULL)),
+					-1, 0, onchaind_memleak_req_done,
+					leaks),
+				    leaks);
 			} else if (streq(c->owner->name, "dualopend")) {
-				start_leak_request(subd_req(c, c->owner,
-					 take(towire_dualopend_dev_memleak(NULL)),
-					 -1, 0, dualopend_memleak_req_done, leaks),
-					leaks);
+				start_leak_request(
+				    subd_req(c, c->owner,
+					     take(towire_dualopend_dev_memleak(
+						 NULL)),
+					     -1, 0, dualopend_memleak_req_done,
+					     leaks),
+				    leaks);
 			}
 		}
 	}

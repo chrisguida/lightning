@@ -14,15 +14,15 @@ struct rel_locktime;
 struct abs_locktime;
 
 /* tal_count() gives the length of the script. */
-u8 *bitcoin_redeem_2of2(const tal_t *ctx,
-			const struct pubkey *key1,
+u8 *bitcoin_redeem_2of2(const tal_t *ctx, const struct pubkey *key1,
 			const struct pubkey *key2);
 
 /* Create an output script using p2sh for this redeem script. */
 u8 *scriptpubkey_p2sh(const tal_t *ctx, const u8 *redeemscript);
 
 /* Create an output script using p2sh for this hash. */
-u8 *scriptpubkey_p2sh_hash(const tal_t *ctx, const struct ripemd160 *redeemhash);
+u8 *scriptpubkey_p2sh_hash(const tal_t *ctx,
+			   const struct ripemd160 *redeemhash);
 
 /* Create an output script using p2pkh */
 u8 *scriptpubkey_p2pkh(const tal_t *ctx, const struct bitcoin_address *addr);
@@ -41,8 +41,7 @@ u8 *bitcoin_redeem_p2pkh(const tal_t *ctx, const struct pubkey *pubkey,
 u8 *bitcoin_redeem_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key);
 
 /* Create the scriptsig for a redeemscript */
-u8 *bitcoin_scriptsig_redeem(const tal_t *ctx,
-			     const u8 *redeemscript TAKES);
+u8 *bitcoin_scriptsig_redeem(const tal_t *ctx, const u8 *redeemscript TAKES);
 
 /* Create scriptsig for p2sh-p2wpkh */
 u8 *bitcoin_scriptsig_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key);
@@ -53,6 +52,12 @@ u8 *p2wpkh_scriptcode(const tal_t *ctx, const struct pubkey *key);
 /* Create an output script for a 32-byte witness program. */
 u8 *scriptpubkey_p2wsh(const tal_t *ctx, const u8 *witnessscript);
 
+/* Retrieve x-only parity bit from pubkey */
+int pubkey_parity(const struct pubkey *pubkey);
+
+/* Create an output script for a taproot output */
+u8 *scriptpubkey_p2tr(const tal_t *ctx, const struct pubkey *pubkey);
+
 /* Create an output script for a 20-byte witness program. */
 u8 *scriptpubkey_p2wpkh(const tal_t *ctx, const struct pubkey *key);
 
@@ -60,20 +65,22 @@ u8 *scriptpubkey_p2wpkh(const tal_t *ctx, const struct pubkey *key);
 u8 *scriptpubkey_p2wpkh_derkey(const tal_t *ctx, const u8 der[33]);
 
 /* Encode an arbitrary witness as <version> <push:wprog> */
-u8 *scriptpubkey_witness_raw(const tal_t *ctx, u8 version,
-			     const u8 *wprog, size_t wprog_size);
+u8 *scriptpubkey_witness_raw(const tal_t *ctx, u8 version, const u8 *wprog,
+			     size_t wprog_size);
 
-/* Create an output script for a "raw"(perhaps already tweaked) taproot output pubkey */
+/* Create an output script for a "raw"(perhaps already tweaked) taproot output
+ * pubkey */
 u8 *scriptpubkey_raw_p2tr(const tal_t *ctx, const struct pubkey *output_pubkey);
 
 /* Same as above, but compressed key is DER-encoded. */
 u8 *scriptpubkey_raw_p2tr_derkey(const tal_t *ctx, const u8 output_der[33]);
 
-/* Create an output script for an internal taproot pubkey. Results in different script than
- * scriptpubkey_raw_p2tr! TODO support merkle root tweaking */
+/* Create an output script for an internal taproot pubkey. Results in different
+ * script than scriptpubkey_raw_p2tr! TODO support merkle root tweaking */
 u8 *scriptpubkey_p2tr(const tal_t *ctx, const struct pubkey *inner_pubkey);
 
-/* Same as above, but compressed key is DER-encoded. TODO support merkle root tweaking */
+/* Same as above, but compressed key is DER-encoded. TODO support merkle root
+ * tweaking */
 u8 *scriptpubkey_p2tr_derkey(const tal_t *ctx, const u8 inner_der[33]);
 
 /* To-remotekey with csv max(lease_expiry - blockheight, 1) delay. */
@@ -85,8 +92,7 @@ u8 *bitcoin_wscript_to_remote_anchored(const tal_t *ctx,
 u8 **bitcoin_witness_2of2(const tal_t *ctx,
 			  const struct bitcoin_signature *sig1,
 			  const struct bitcoin_signature *sig2,
-			  const struct pubkey *key1,
-			  const struct pubkey *key2);
+			  const struct pubkey *key1, const struct pubkey *key2);
 
 /* Create a witness which spends a p2wpkh. */
 u8 **bitcoin_witness_p2wpkh(const tal_t *ctx,
@@ -98,6 +104,14 @@ u8 **bitcoin_witness_sig_and_element(const tal_t *ctx,
 				     const struct bitcoin_signature *sig,
 				     const void *elem, size_t elemsize,
 				     const u8 *witnessscript);
+
+/* Create a witness which contains a sig, and possibly another entry, tapscript
+ * and control block for BIP342 spends */
+u8 **bitcoin_witness_bip340sig_and_element(const tal_t *ctx,
+					   const struct bip340sig *sig,
+					   const void *elem, size_t elemsize,
+					   const u8 *tapscript,
+					   const u8 *control_block);
 
 /* BOLT #3 to-local output */
 u8 *bitcoin_wscript_to_local(const tal_t *ctx, u16 to_self_delay,
@@ -117,14 +131,11 @@ u8 **bitcoin_witness_htlc_timeout_tx(const tal_t *ctx,
 				     const struct bitcoin_signature *localsig,
 				     const struct bitcoin_signature *remotesig,
 				     const u8 *wscript);
-u8 *bitcoin_wscript_htlc_receive(const tal_t *ctx,
-				 const struct abs_locktime *htlc_abstimeout,
-				 const struct pubkey *localkey,
-				 const struct pubkey *remotekey,
-				 const struct sha256 *payment_hash,
-				 const struct pubkey *revocationkey,
-				 bool option_anchor_outputs,
-				 bool option_anchors_zero_fee_htlc_tx);
+u8 *bitcoin_wscript_htlc_receive(
+    const tal_t *ctx, const struct abs_locktime *htlc_abstimeout,
+    const struct pubkey *localkey, const struct pubkey *remotekey,
+    const struct sha256 *payment_hash, const struct pubkey *revocationkey,
+    bool option_anchor_outputs, bool option_anchors_zero_fee_htlc_tx);
 u8 **bitcoin_witness_htlc_success_tx(const tal_t *ctx,
 				     const struct bitcoin_signature *localsig,
 				     const struct bitcoin_signature *remotesig,
@@ -139,18 +150,14 @@ u8 *bitcoin_wscript_htlc_offer_ripemd160(const tal_t *ctx,
 					 const struct pubkey *revocationkey,
 					 bool option_anchor_outputs,
 					 bool option_anchors_zero_fee_htlc_tx);
-u8 *bitcoin_wscript_htlc_receive_ripemd(const tal_t *ctx,
-					const struct abs_locktime *htlc_abstimeout,
-					const struct pubkey *localkey,
-					const struct pubkey *remotekey,
-					const struct ripemd160 *payment_ripemd,
-					const struct pubkey *revocationkey,
-					bool option_anchor_outputs,
-					bool option_anchors_zero_fee_htlc_tx);
+u8 *bitcoin_wscript_htlc_receive_ripemd(
+    const tal_t *ctx, const struct abs_locktime *htlc_abstimeout,
+    const struct pubkey *localkey, const struct pubkey *remotekey,
+    const struct ripemd160 *payment_ripemd, const struct pubkey *revocationkey,
+    bool option_anchor_outputs, bool option_anchors_zero_fee_htlc_tx);
 
 /* BOLT #3 HTLC-success/HTLC-timeout output */
-u8 *bitcoin_wscript_htlc_tx(const tal_t *ctx,
-			    u16 to_self_delay,
+u8 *bitcoin_wscript_htlc_tx(const tal_t *ctx, u16 to_self_delay,
 			    const struct pubkey *revocation_pubkey,
 			    const struct pubkey *local_delayedkey);
 
@@ -169,6 +176,12 @@ bool is_p2wsh(const u8 *script, struct sha256 *addr);
 
 /* Is this (version 0) pay to witness pubkey hash? (extract addr if not NULL) */
 bool is_p2wpkh(const u8 *script, struct bitcoin_address *addr);
+
+/* Is this a taproot output? (exract xonly_pubkey bytes if not NULL) */
+bool is_p2tr(const u8 *script, u8 *xonly_pubkey);
+
+/* Is this output an ephemeral anchor? */
+bool is_ephemeral_anchor(const u8 *script);
 
 /* Is this a taproot output? (extract xonly_pubkey bytes if not NULL) */
 bool is_p2tr(const u8 *script, u8 xonly_pubkey[32]);
@@ -190,6 +203,60 @@ bool scripteq(const u8 *s1, const u8 *s2);
 
 /* Raw "push these bytes" accessor. */
 void script_push_bytes(u8 **scriptp, const void *mem, size_t len);
+
+/* "anyonecanspend" Ephemeral anchor outputs */
+u8 *bitcoin_spk_ephemeral_anchor(const tal_t *ctx);
+
+/* Computes taproot merkle root from list of up to two scripts in depth 1 tree,
+ * in order */
+void compute_taptree_merkle_root(struct sha256 *hash_out, u8 **scripts,
+				 size_t num_scripts);
+
+/* Compute merkle root via annex hint from invalidated update tx */
+void compute_taptree_merkle_root_with_hint(struct sha256 *update_merkle_root,
+					   const u8 *update_tapscript,
+					   const u8 *invalidated_annex_hint);
+
+/* Computes control block for a spend from a taptree of size two, depth of 1,
+ * tops. other_script is NULL if only one script is committed. Returns the
+ * control block array.
+ * @other_script: The script that needs to be hashed and put in control block
+ * @annex_hint: ... or if @other_script is NULL, must supply annex hint from the
+ * posted update tx
+ * @inner_pubkey: Inner pubkey for taproot control block
+ * @parity_bit: Parity of outer taproot pubkey
+ */
+u8 *compute_control_block(const tal_t *ctx, const u8 *other_script,
+			  const u8 *annex_hint,
+			  const struct pubkey *inner_pubkey, int parity_bit);
+
+/* Creates tapscript that makes a sig-in-script ANYPREVOUTANYSCRIPT covenant
+ * which commits to the tx argument:
+ * CovSig(n) 1_G OP_CHECKSIG
+ */
+u8 *make_eltoo_settle_script(const tal_t *ctx,
+			     const struct bitcoin_tx *settle_tx,
+			     size_t input_index);
+
+/* Creates the update path tapscript for eltoo, which commits to the masked
+ * update number */
+u8 *make_eltoo_update_script(const tal_t *ctx, u32 update_num);
+
+/* Creates the update path tapscript for the special case of a funding output
+ * being spent, which is ~4 WU smaller for the average non-adversarial
+ * unilateral close
+ */
+u8 *make_eltoo_funding_update_script(const tal_t *ctx);
+
+/* Creates eltoo HTLC success script, with invoice hash lock */
+u8 *make_eltoo_htlc_success_script(const tal_t *ctx,
+				   const struct pubkey *settlement_pubkey,
+				   const struct ripemd160 *invoice_hash);
+
+/* Creates eltoo HTLC timeout script, with timeout value */
+u8 *make_eltoo_htlc_timeout_script(const tal_t *ctx,
+				   const struct pubkey *settlement_pubkey,
+				   u32 htlc_timeout);
 
 /* OP_DUP + OP_HASH160 + PUSH(20-byte-hash) + OP_EQUALVERIFY + OP_CHECKSIG */
 #define BITCOIN_SCRIPTPUBKEY_P2PKH_LEN (1 + 1 + 1 + 20 + 1 + 1)

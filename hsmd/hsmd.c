@@ -40,7 +40,8 @@ struct secret hsm_secret;
 
 /*~ We keep track of clients, but there's not much to keep. */
 struct client {
-	/* The ccan/io async io connection for this client: it closes, we die. */
+	/* The ccan/io async io connection for this client: it closes, we die.
+	 */
 	struct io_conn *conn;
 
 	/*~ io_read_wire needs a pointer to store incoming messages until
@@ -103,16 +104,12 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c);
  * and closes the client connection.  This should never happen, of course, but
  * we definitely want to log if it does.
  */
-static struct io_plan *bad_req_fmt(struct io_conn *conn,
-				   struct client *c,
-				   const u8 *msg_in,
-				   const char *fmt, ...)
-	PRINTF_FMT(4,5);
+static struct io_plan *bad_req_fmt(struct io_conn *conn, struct client *c,
+				   const u8 *msg_in, const char *fmt, ...)
+    PRINTF_FMT(4, 5);
 
-static struct io_plan *bad_req_fmt(struct io_conn *conn,
-				   struct client *c,
-				   const u8 *msg_in,
-				   const char *fmt, ...)
+static struct io_plan *bad_req_fmt(struct io_conn *conn, struct client *c,
+				   const u8 *msg_in, const char *fmt, ...)
 {
 	va_list ap;
 	char *str;
@@ -128,8 +125,10 @@ static struct io_plan *bad_req_fmt(struct io_conn *conn,
 		master_badmsg(fromwire_peektype(msg_in), msg_in);
 	}
 
-	/*~ Nobody should give us bad requests; it's a sign something is broken */
-	status_broken("%s: %s", type_to_string(tmpctx, struct node_id, &c->id), str);
+	/*~ Nobody should give us bad requests; it's a sign something is broken
+	 */
+	status_broken("%s: %s", type_to_string(tmpctx, struct node_id, &c->id),
+		      str);
 
 	/*~ Note the use of NULL as the ctx arg to towire_hsmstatus_: only
 	 * use NULL as the allocation when we're about to immediately free it
@@ -137,11 +136,8 @@ static struct io_plan *bad_req_fmt(struct io_conn *conn,
 	 * expect it to linger, and in fact our memleak detection will
 	 * complain if it does (unlike using the deliberately-transient
 	 * tmpctx). */
-	daemon_conn_send(status_conn,
-			 take(towire_hsmstatus_client_bad_request(NULL,
-								  &c->id,
-								  str,
-								  msg_in)));
+	daemon_conn_send(status_conn, take(towire_hsmstatus_client_bad_request(
+					  NULL, &c->id, str, msg_in)));
 
 	/*~ The way ccan/io works is that you return the "plan" for what to do
 	 * next (eg. io_read).  io_close() is special: it means to close the
@@ -150,8 +146,7 @@ static struct io_plan *bad_req_fmt(struct io_conn *conn,
 }
 
 /* Convenience wrapper for when we simply can't parse. */
-static struct io_plan *bad_req(struct io_conn *conn,
-			       struct client *c,
+static struct io_plan *bad_req(struct io_conn *conn, struct client *c,
 			       const u8 *msg_in)
 {
 	return bad_req_fmt(conn, c, msg_in, "could not parse request");
@@ -172,15 +167,13 @@ static void destroy_client(struct client *c)
 {
 	if (!uintmap_del(&clients, c->dbid))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "Failed to remove client dbid %"PRIu64, c->dbid);
+			      "Failed to remove client dbid %" PRIu64, c->dbid);
 }
 
 static struct client *new_client(const tal_t *ctx,
 				 const struct chainparams *chainparams,
-				 const struct node_id *id,
-				 u64 dbid,
-				 const u64 capabilities,
-				 int fd)
+				 const struct node_id *id, u64 dbid,
+				 const u64 capabilities, int fd)
 {
 	struct client *c = tal(ctx, struct client);
 
@@ -190,10 +183,9 @@ static struct client *new_client(const tal_t *ctx,
 	if (id) {
 		c->id = *id;
 		if (!node_id_valid(id))
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "Invalid node id %s",
-				      type_to_string(tmpctx, struct node_id,
-						     id));
+			status_failed(
+			    STATUS_FAIL_INTERNAL_ERROR, "Invalid node id %s",
+			    type_to_string(tmpctx, struct node_id, id));
 	} else {
 		memset(&c->id, 0, sizeof(c->id));
 	}
@@ -235,7 +227,7 @@ static struct client *new_client(const tal_t *ctx,
 
 		if (!uintmap_add(&clients, dbid, c))
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "Failed inserting dbid %"PRIu64, dbid);
+				      "Failed inserting dbid %" PRIu64, dbid);
 		tal_add_destructor(c, destroy_client);
 		c->hsmd_client =
 		    hsmd_client_new_peer(c, c->capabilities, dbid, id, c);
@@ -245,8 +237,7 @@ static struct client *new_client(const tal_t *ctx,
 }
 
 /* This is the common pattern for the tail of each handler in this file. */
-static struct io_plan *req_reply(struct io_conn *conn,
-				 struct client *c,
+static struct io_plan *req_reply(struct io_conn *conn, struct client *c,
 				 const u8 *msg_out TAKES)
 {
 	/*~ Write this out, then read the next one.  This works perfectly for
@@ -280,14 +271,14 @@ static void create_encrypted_hsm(int fd, const struct secret *encryption_key)
 {
 	struct encrypted_hsm_secret cipher;
 
-	if (!encrypt_hsm_secret(encryption_key, &hsm_secret,
-				&cipher))
+	if (!encrypt_hsm_secret(encryption_key, &hsm_secret, &cipher))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Encrypting hsm_secret");
 	if (!write_all(fd, cipher.data, ENCRYPTED_HSM_SECRET_LEN)) {
 		unlink_noerr("hsm_secret");
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-		              "Writing encrypted hsm_secret: %s", strerror(errno));
+			      "Writing encrypted hsm_secret: %s",
+			      strerror(errno));
 	}
 }
 
@@ -300,25 +291,25 @@ static void create_hsm(int fd)
 		/* ccan/noerr contains useful routines like this, which don't
 		 * clobber errno, so we can use it in our error report. */
 		unlink_noerr("hsm_secret");
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-		              "writing: %s", strerror(errno));
+		status_failed(STATUS_FAIL_INTERNAL_ERROR, "writing: %s",
+			      strerror(errno));
 	}
 }
 
 /*~ We store our root secret in a "hsm_secret" file (like all of Core Lightning,
  * we run in the user's .lightning directory). */
 static void maybe_create_new_hsm(const struct secret *encryption_key,
-                                 bool random_hsm)
+				 bool random_hsm)
 {
 	/*~ Note that this is opened for write-only, even though the permissions
 	 * are set to read-only.  That's perfectly valid! */
-	int fd = open("hsm_secret", O_CREAT|O_EXCL|O_WRONLY, 0400);
+	int fd = open("hsm_secret", O_CREAT | O_EXCL | O_WRONLY, 0400);
 	if (fd < 0) {
 		/* If this is not the first time we've run, it will exist. */
 		if (errno == EEXIST)
 			return;
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-		              "creating: %s", strerror(errno));
+		status_failed(STATUS_FAIL_INTERNAL_ERROR, "creating: %s",
+			      strerror(errno));
 	}
 
 	/*~ This is libsodium's cryptographic randomness routine: we assume
@@ -335,28 +326,28 @@ static void maybe_create_new_hsm(const struct secret *encryption_key,
 	/*~ fsync (mostly!) ensures that the file has reached the disk. */
 	if (fsync(fd) != 0) {
 		unlink_noerr("hsm_secret");
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "fsync: %s", strerror(errno));
+		status_failed(STATUS_FAIL_INTERNAL_ERROR, "fsync: %s",
+			      strerror(errno));
 	}
 	/*~ This should never fail if fsync succeeded.  But paranoia good, and
 	 * bugs exist. */
 	if (close(fd) != 0) {
 		unlink_noerr("hsm_secret");
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "closing: %s", strerror(errno));
+		status_failed(STATUS_FAIL_INTERNAL_ERROR, "closing: %s",
+			      strerror(errno));
 	}
 	/*~ We actually need to sync the *directory itself* to make sure the
 	 * file exists!  You're only allowed to open directories read-only in
 	 * modern Unix though. */
 	fd = open(".", O_RDONLY);
 	if (fd < 0) {
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "opening: %s", strerror(errno));
+		status_failed(STATUS_FAIL_INTERNAL_ERROR, "opening: %s",
+			      strerror(errno));
 	}
 	if (fsync(fd) != 0) {
 		unlink_noerr("hsm_secret");
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "fsyncdir: %s", strerror(errno));
+		status_failed(STATUS_FAIL_INTERNAL_ERROR, "fsyncdir: %s",
+			      strerror(errno));
 	}
 	close(fd);
 	/*~ status_unusual() is good for things which are interesting and
@@ -374,31 +365,33 @@ static void load_hsm(const struct secret *encryption_key)
 	struct stat st;
 	int fd = open("hsm_secret", O_RDONLY);
 	if (fd < 0)
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "opening: %s", strerror(errno));
+		status_failed(STATUS_FAIL_INTERNAL_ERROR, "opening: %s",
+			      strerror(errno));
 	if (stat("hsm_secret", &st) != 0)
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-		              "stating: %s", strerror(errno));
+		status_failed(STATUS_FAIL_INTERNAL_ERROR, "stating: %s",
+			      strerror(errno));
 
 	/* If the seed is stored in clear. */
 	if (st.st_size == 32) {
 		if (!read_all(fd, &hsm_secret, sizeof(hsm_secret)))
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			              "reading: %s", strerror(errno));
-		/* If an encryption key was passed with a not yet encrypted hsm_secret,
-		 * remove the old one and create an encrypted one. */
+			status_failed(STATUS_FAIL_INTERNAL_ERROR, "reading: %s",
+				      strerror(errno));
+		/* If an encryption key was passed with a not yet encrypted
+		 * hsm_secret, remove the old one and create an encrypted one.
+		 */
 		if (encryption_key) {
 			if (close(fd) != 0)
 				status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				              "closing: %s", strerror(errno));
+					      "closing: %s", strerror(errno));
 			if (remove("hsm_secret") != 0)
 				status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				              "removing clear hsm_secret: %s", strerror(errno));
+					      "removing clear hsm_secret: %s",
+					      strerror(errno));
 			maybe_create_new_hsm(encryption_key, false);
 			fd = open("hsm_secret", O_RDONLY);
 			if (fd < 0)
 				status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				              "opening: %s", strerror(errno));
+					      "opening: %s", strerror(errno));
 		}
 	}
 	/* If an encryption key was passed and the `hsm_secret` is stored
@@ -409,28 +402,30 @@ static void load_hsm(const struct secret *encryption_key)
 		/* hsm_control must have checked it! */
 		assert(encryption_key);
 
-		if (!read_all(fd, encrypted_secret.data, ENCRYPTED_HSM_SECRET_LEN))
+		if (!read_all(fd, encrypted_secret.data,
+			      ENCRYPTED_HSM_SECRET_LEN))
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			              "Reading encrypted hsm_secret: %s", strerror(errno));
+				      "Reading encrypted hsm_secret: %s",
+				      strerror(errno));
 		if (!decrypt_hsm_secret(encryption_key, &encrypted_secret,
 					&hsm_secret)) {
-			/* Exit but don't throw a backtrace when the user made a mistake in typing
-			 * its password. Instead exit and `lightningd` will be able to give
-			 * an error message. */
+			/* Exit but don't throw a backtrace when the user made a
+			 * mistake in typing its password. Instead exit and
+			 * `lightningd` will be able to give an error message.
+			 */
 			exit(1);
 		}
-	}
-	else
-		status_failed(STATUS_FAIL_INTERNAL_ERROR, "Invalid hsm_secret, "
-							  "no plaintext nor encrypted"
-							  " seed.");
+	} else
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Invalid hsm_secret, "
+			      "no plaintext nor encrypted"
+			      " seed.");
 	close(fd);
 }
 
 /*~ This is the response to lightningd's HSM_INIT request, which is the first
  * thing it sends. */
-static struct io_plan *init_hsm(struct io_conn *conn,
-				struct client *c,
+static struct io_plan *init_hsm(struct io_conn *conn, struct client *c,
 				const u8 *msg_in)
 {
 	struct secret *hsm_encryption_key;
@@ -445,30 +440,28 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 	 * definitions in hsm_client_wire.csv.  The format of those files is
 	 * an extension of the simple comma-separated format output by the
 	 * BOLT tools/extract-formats.py tool. */
-	if (!fromwire_hsmd_init(NULL, msg_in, &bip32_key_version, &chainparams,
-				&hsm_encryption_key,
-				&dev_force_privkey,
-				&dev_force_bip32_seed,
-				&dev_force_channel_secrets,
-				&dev_force_channel_secrets_shaseed,
-				&minversion, &maxversion))
+	if (!fromwire_hsmd_init(
+		NULL, msg_in, &bip32_key_version, &chainparams,
+		&hsm_encryption_key, &dev_force_privkey, &dev_force_bip32_seed,
+		&dev_force_channel_secrets, &dev_force_channel_secrets_shaseed,
+		&minversion, &maxversion))
 		return bad_req(conn, c, msg_in);
 
 	/*~ Usually we don't worry about API breakage between internal daemons,
 	 * but there are other implementations of the HSM daemon now, so we
 	 * do at least the simplest, clearest thing. */
 	if (our_minversion > maxversion || our_maxversion < minversion)
-		return bad_req_fmt(conn, c, msg_in,
-				   "Version %u-%u not valid: we need %u-%u",
-				   minversion, maxversion,
-				   our_minversion, our_maxversion);
+		return bad_req_fmt(
+		    conn, c, msg_in, "Version %u-%u not valid: we need %u-%u",
+		    minversion, maxversion, our_minversion, our_maxversion);
 
 	/*~ The memory is actually copied in towire(), so lock the `hsm_secret`
 	 * encryption key (new) memory again here. */
-	if (hsm_encryption_key && sodium_mlock(hsm_encryption_key,
-	                                       sizeof(hsm_encryption_key)) != 0)
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-		              "Could not lock memory for hsm_secret encryption key.");
+	if (hsm_encryption_key &&
+	    sodium_mlock(hsm_encryption_key, sizeof(hsm_encryption_key)) != 0)
+		status_failed(
+		    STATUS_FAIL_INTERNAL_ERROR,
+		    "Could not lock memory for hsm_secret encryption key.");
 	/*~ Don't swap this. */
 	sodium_mlock(hsm_secret.data, sizeof(hsm_secret.data));
 
@@ -524,8 +517,7 @@ static struct io_plan *send_pending_client_fd(struct io_conn *conn,
 
 /*~ This is used by the master to create a new client connection (which
  * becomes the HSM_FD for the subdaemon after forking). */
-static struct io_plan *pass_client_hsmfd(struct io_conn *conn,
-					 struct client *c,
+static struct io_plan *pass_client_hsmfd(struct io_conn *conn, struct client *c,
 					 const u8 *msg_in)
 {
 	int fds[2];
@@ -543,7 +535,7 @@ static struct io_plan *pass_client_hsmfd(struct io_conn *conn,
 		status_failed(STATUS_FAIL_INTERNAL_ERROR, "creating fds: %s",
 			      strerror(errno));
 
-	status_debug("new_client: %"PRIu64, dbid);
+	status_debug("new_client: %" PRIu64, dbid);
 	new_client(c, c->chainparams, &id, dbid, capabilities, fds[0]);
 
 	/*~ We stash this in a global, because we need to get both the fd and
@@ -554,8 +546,7 @@ static struct io_plan *pass_client_hsmfd(struct io_conn *conn,
 			     send_pending_client_fd, c);
 }
 
-static struct io_plan *handle_memleak(struct io_conn *conn,
-				      struct client *c,
+static struct io_plan *handle_memleak(struct io_conn *conn, struct client *c,
 				      const u8 *msg_in)
 {
 	struct htable *memtable;
@@ -566,7 +557,8 @@ static struct io_plan *handle_memleak(struct io_conn *conn,
 	memleak_ptr(memtable, msg_in);
 
 	/* Now note clients and anything they point to. */
-	memleak_scan_region(memtable, dbid_zero_clients, sizeof(dbid_zero_clients));
+	memleak_scan_region(memtable, dbid_zero_clients,
+			    sizeof(dbid_zero_clients));
 	memleak_scan_uintmap(memtable, &clients);
 	memleak_scan_obj(memtable, status_conn);
 
@@ -578,11 +570,12 @@ static struct io_plan *handle_memleak(struct io_conn *conn,
 	return req_reply(conn, c, take(reply));
 }
 
-u8 *hsmd_status_bad_request(struct hsmd_client *client, const u8 *msg, const char *error)
+u8 *hsmd_status_bad_request(struct hsmd_client *client, const u8 *msg,
+			    const char *error)
 {
 	/* Extract the pointer to the hsmd representation of the
 	 * client which has access to the underlying connection. */
-	struct client *c = (struct client*)client->extra;
+	struct client *c = (struct client *)client->extra;
 	bad_req_fmt(c->conn, c, msg, "%s", error);
 
 	/* We often use `return hsmd_status_bad_request` to drop out, and NULL
@@ -645,9 +638,9 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 		/* fall thru */
 	case WIRE_HSMD_NEW_CHANNEL:
 	case WIRE_HSMD_SETUP_CHANNEL:
- 	case WIRE_HSMD_CHECK_OUTPOINT:
- 	case WIRE_HSMD_LOCK_OUTPOINT:
- 	case WIRE_HSMD_FORGET_CHANNEL:
+	case WIRE_HSMD_CHECK_OUTPOINT:
+	case WIRE_HSMD_LOCK_OUTPOINT:
+	case WIRE_HSMD_FORGET_CHANNEL:
 	case WIRE_HSMD_SIGN_COMMITMENT_TX:
 	case WIRE_HSMD_VALIDATE_COMMITMENT_TX:
 	case WIRE_HSMD_VALIDATE_REVOCATION:
@@ -682,6 +675,17 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSMD_SIGN_ANY_LOCAL_HTLC_TX:
 	case WIRE_HSMD_SIGN_ANCHORSPEND:
 	case WIRE_HSMD_SIGN_HTLC_TX_MINGLE:
+	/* Eltoo stuff here */
+	case WIRE_HSMD_READY_ELTOO_CHANNEL:
+	case WIRE_HSMD_PSIGN_UPDATE_TX:
+	case WIRE_HSMD_COMBINE_PSIG:
+	case WIRE_HSMD_VALIDATE_UPDATE_TX_PSIG:
+	case WIRE_HSMD_GEN_NONCE:
+	case WIRE_HSMD_MIGRATE_NONCE:
+	case WIRE_HSMD_SIGN_ELTOO_HTLC_TIMEOUT_TX:
+	case WIRE_HSMD_SIGN_ELTOO_HTLC_SUCCESS_TX:
+	case WIRE_HSMD_REGEN_NONCE:
+		/* Eltoo stuff ends */
 		/* Hand off to libhsmd for processing */
 		return req_reply(conn, c,
 				 take(hsmd_handle_client_message(
@@ -695,7 +699,7 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSMD_SETUP_CHANNEL_REPLY:
 	case WIRE_HSMD_CHECK_OUTPOINT_REPLY:
 	case WIRE_HSMD_LOCK_OUTPOINT_REPLY:
- 	case WIRE_HSMD_FORGET_CHANNEL_REPLY:
+	case WIRE_HSMD_FORGET_CHANNEL_REPLY:
 	case WIRE_HSMD_NODE_ANNOUNCEMENT_SIG_REPLY:
 	case WIRE_HSMD_SIGN_WITHDRAWAL_REPLY:
 	case WIRE_HSMD_SIGN_INVOICE_REPLY:
@@ -720,6 +724,14 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSMD_CHECK_PUBKEY_REPLY:
 	case WIRE_HSMD_SIGN_ANCHORSPEND_REPLY:
 	case WIRE_HSMD_SIGN_HTLC_TX_MINGLE_REPLY:
+	case WIRE_HSMD_READY_ELTOO_CHANNEL_REPLY:
+	case WIRE_HSMD_PSIGN_UPDATE_TX_REPLY:
+	case WIRE_HSMD_COMBINE_PSIG_REPLY:
+	case WIRE_HSMD_VALIDATE_UPDATE_TX_PSIG_REPLY:
+	case WIRE_HSMD_GEN_NONCE_REPLY:
+	case WIRE_HSMD_REGEN_NONCE_REPLY:
+	case WIRE_HSMD_MIGRATE_NONCE_REPLY:
+	case WIRE_HSMD_SIGN_ELTOO_TX_REPLY:
 		return bad_req_fmt(conn, c, c->msg_in,
 				   "Received an incoming message of type %s, "
 				   "which is not a request",
@@ -750,9 +762,9 @@ int main(int argc, char *argv[])
 	status_setup_async(status_conn);
 	uintmap_init(&clients);
 
-	master = new_client(NULL, NULL, NULL, 0,
-			    HSM_PERM_MASTER | HSM_PERM_SIGN_GOSSIP | HSM_PERM_ECDH,
-			    REQ_FD);
+	master = new_client(
+	    NULL, NULL, NULL, 0,
+	    HSM_PERM_MASTER | HSM_PERM_SIGN_GOSSIP | HSM_PERM_ECDH, REQ_FD);
 
 	/* First client == lightningd. */
 	assert(is_lightningd(master));

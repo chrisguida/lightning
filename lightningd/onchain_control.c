@@ -35,8 +35,7 @@ static void onchaind_tell_fulfill(struct channel *channel)
 	u8 *msg;
 	struct lightningd *ld = channel->peer->ld;
 
-	for (hin = htlc_in_map_first(ld->htlcs_in, &ini);
-	     hin;
+	for (hin = htlc_in_map_first(ld->htlcs_in, &ini); hin;
 	     hin = htlc_in_map_next(ld->htlcs_in, &ini)) {
 		if (hin->key.channel != channel)
 			continue;
@@ -50,8 +49,10 @@ static void onchaind_tell_fulfill(struct channel *channel)
 		 *  for which it has committed to an outgoing HTLC:
 		 *    - MUST *resolve* the output by spending it, using the
 		 *      HTLC-success transaction.
-		 *    - MUST NOT reveal its own preimage when it's not the final recipient...
-		 *    - MUST resolve the output of that HTLC-success transaction.
+		 *    - MUST NOT reveal its own preimage when it's not the final
+		 recipient...
+		 *    - MUST resolve the output of that HTLC-success
+		 transaction.
 		 *  - otherwise:
 		 *      - if the *remote node* is NOT irrevocably committed to
 		 *        the HTLC:
@@ -71,8 +72,7 @@ static void onchaind_tell_fulfill(struct channel *channel)
 
 /* If we want to know if this HTLC is missing, return depth. */
 static bool tell_if_missing(const struct channel *channel,
-			    struct htlc_stub *stub,
-			    bool *tell_immediate)
+			    struct htlc_stub *stub, bool *tell_immediate)
 {
 	struct htlc_out *hout;
 
@@ -98,12 +98,12 @@ static bool tell_if_missing(const struct channel *channel,
 	 *       corresponding to the HTLC.
 	 *       - MAY fail the corresponding incoming HTLC sooner.
 	 */
-	if (hout->hstate >= RCVD_ADD_REVOCATION
-	    && hout->hstate < SENT_REMOVE_REVOCATION)
+	if (hout->hstate >= RCVD_ADD_REVOCATION &&
+	    hout->hstate < SENT_REMOVE_REVOCATION)
 		*tell_immediate = true;
 
 	log_debug(channel->log,
-		  "We want to know if htlc %"PRIu64" is missing (%s)",
+		  "We want to know if htlc %" PRIu64 " is missing (%s)",
 		  hout->key.id, *tell_immediate ? "immediate" : "later");
 	return true;
 }
@@ -115,16 +115,14 @@ static void handle_onchain_init_reply(struct channel *channel, const u8 *msg)
 	bool *tell, *tell_immediate;
 
 	if (!fromwire_onchaind_init_reply(msg, &commit_num)) {
-		channel_internal_error(channel, "Invalid onchaind_init_reply %s",
+		channel_internal_error(channel,
+				       "Invalid onchaind_init_reply %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
 
 	/* FIXME: We may already be ONCHAIN state when we implement restart! */
-	channel_set_state(channel,
-			  FUNDING_SPEND_SEEN,
-			  ONCHAIN,
-			  REASON_UNKNOWN,
+	channel_set_state(channel, FUNDING_SPEND_SEEN, ONCHAIN, REASON_UNKNOWN,
 			  "Onchain init reply");
 
 	/* Tell it about any relevant HTLCs */
@@ -135,13 +133,56 @@ static void handle_onchain_init_reply(struct channel *channel, const u8 *msg)
 	tell_immediate = tal_arr(stubs, bool, tal_count(stubs));
 
 	for (size_t i = 0; i < tal_count(stubs); i++) {
-		tell[i] = tell_if_missing(channel, &stubs[i],
-					  &tell_immediate[i]);
+		tell[i] =
+		    tell_if_missing(channel, &stubs[i], &tell_immediate[i]);
 	}
 	msg = towire_onchaind_htlcs(channel, stubs, tell, tell_immediate);
 	subd_send_msg(channel->owner, take(msg));
 
 	/* Tell it about any preimages we know. */
+	onchaind_tell_fulfill(channel);
+}
+
+/* Only change here is fromwire_eltoo_onchaind_init_reply without commit_num
+   and FIXME in the future we will grab the O(1) HTLC records for latest tx
+   rather than the growing HTLC db. We can probably drop the "tell" stuff? */
+static void handle_eltoo_onchain_init_reply(struct channel *channel,
+					    const u8 *msg)
+{
+	struct htlc_stub *stubs;
+	bool *tell, *tell_immediate;
+
+	/* Signaling ready, send more data */
+	if (!fromwire_eltoo_onchaind_init_reply(msg)) {
+		channel_internal_error(channel,
+				       "Invalid eltoo_onchaind_init_reply %s",
+				       tal_hex(tmpctx, msg));
+		return;
+	}
+
+	/* FIXME: We may already be ONCHAIN state when we implement restart! */
+	channel_set_state(channel, FUNDING_SPEND_SEEN /* old_state */,
+			  ONCHAIN /* state */, REASON_UNKNOWN,
+			  "Onchain init reply");
+
+	/* Tell it about any relevant HTLCs. Future Work: Delete stale HTLCS
+	 * from db */
+	stubs =
+	    all_wallet_htlc_stubs(tmpctx, channel->peer->ld->wallet, channel);
+	tell = tal_arr(stubs, bool, tal_count(stubs));
+	tell_immediate = tal_arr(stubs, bool, tal_count(stubs));
+
+	for (size_t i = 0; i < tal_count(stubs); i++) {
+		tell[i] =
+		    tell_if_missing(channel, &stubs[i], &tell_immediate[i]);
+	}
+	msg = towire_onchaind_htlcs(channel, stubs, tell, tell_immediate);
+
+	log_info(channel->log, "Telling eltoo_onchaind about %lu HTLCs",
+		 tal_count(stubs));
+	subd_send_msg(channel->owner, take(msg));
+
+	/* Finally, tell it about any preimages we know. */
 	onchaind_tell_fulfill(channel);
 }
 
@@ -173,13 +214,10 @@ static enum watch_result onchain_tx_watched(struct lightningd *ld,
 
 		bitcoin_txid(tx, &txid2);
 		if (!bitcoin_txid_eq(txid, &txid2)) {
-			channel_internal_error(channel, "Txid for %s is not %s",
-					       type_to_string(tmpctx,
-							      struct bitcoin_tx,
-							      tx),
-					       type_to_string(tmpctx,
-							      struct bitcoin_txid,
-							      txid));
+			channel_internal_error(
+			    channel, "Txid for %s is not %s",
+			    type_to_string(tmpctx, struct bitcoin_tx, tx),
+			    type_to_string(tmpctx, struct bitcoin_txid, txid));
 			return DELETE_WATCH;
 		}
 	}
@@ -193,8 +231,8 @@ static enum watch_result onchain_tx_watched(struct lightningd *ld,
 	}
 
 	/* Store the channeltx so we can replay later */
-	wallet_channeltxs_add(ld->wallet, channel,
-			      WIRE_ONCHAIND_DEPTH, txid, 0, blockheight);
+	wallet_channeltxs_add(ld->wallet, channel, WIRE_ONCHAIND_DEPTH, txid, 0,
+			      blockheight);
 
 	onchain_tx_depth(channel, txid, depth);
 	return KEEP_WATCHING;
@@ -206,19 +244,21 @@ static void watch_tx_and_outputs(struct channel *channel,
 /**
  * Notify onchaind that an output was spent and register new watches.
  */
-static void onchain_txo_spent(struct channel *channel, const struct bitcoin_tx *tx, size_t input_num, u32 blockheight)
+static void onchain_txo_spent(struct channel *channel,
+			      const struct bitcoin_tx *tx, size_t input_num,
+			      u32 blockheight)
 {
 	u8 *msg;
 	/* Onchaind needs all inputs, since it uses those to compare
 	 * with existing spends (which can vary, with feerate changes). */
-	struct tx_parts *parts = tx_parts_from_wally_tx(tmpctx, tx->wtx,
-							-1, -1);
+	struct tx_parts *parts =
+	    tx_parts_from_wally_tx(tmpctx, tx->wtx, -1, -1);
 
 	watch_tx_and_outputs(channel, tx);
 
-	msg = towire_onchaind_spent(channel, parts, input_num, blockheight);
+	msg = towire_onchaind_spent(channel, parts, tx->wtx->locktime,
+				    input_num, blockheight);
 	subd_send_msg(channel->owner, take(msg));
-
 }
 
 /**
@@ -256,8 +296,7 @@ static void watch_tx_and_outputs(struct channel *channel,
 	bitcoin_txid(tx, &outpoint.txid);
 
 	/* Make txwatch a parent of txo watches, so we can unwatch together. */
-	txw = watch_txid(channel->owner, ld->topology,
-			 &outpoint.txid,
+	txw = watch_txid(channel->owner, ld->topology, &outpoint.txid,
 			 onchain_tx_watched, channel);
 
 	for (outpoint.n = 0; outpoint.n < tx->wtx->num_outputs; outpoint.n++)
@@ -270,19 +309,48 @@ static void handle_onchain_log_coin_move(struct channel *channel, const u8 *msg)
 	struct chain_coin_mvt *mvt = tal(NULL, struct chain_coin_mvt);
 
 	if (!fromwire_onchaind_notify_coin_mvt(msg, mvt)) {
-		channel_internal_error(channel, "Invalid onchain notify_coin_mvt");
+		channel_internal_error(channel,
+				       "Invalid onchain notify_coin_mvt");
 		return;
 	}
 
 	/* Any 'ignored' payments get registed to the wallet */
 	if (!mvt->account_name)
-		mvt->account_name = type_to_string(mvt, struct channel_id,
-						   &channel->cid);
+		mvt->account_name =
+		    type_to_string(mvt, struct channel_id, &channel->cid);
 	else
-		mvt->originating_acct = type_to_string(mvt, struct channel_id,
-						       &channel->cid);
+		mvt->originating_acct =
+		    type_to_string(mvt, struct channel_id, &channel->cid);
 	notify_chain_mvt(channel->peer->ld, mvt);
 	tal_free(mvt);
+}
+
+static void handle_new_state_output(struct channel *channel, const u8 *msg)
+{
+	struct bitcoin_outpoint out;
+	u32 invalidated_update_num;
+	u8 *invalidated_annext_hint;
+
+	if (!fromwire_eltoo_onchaind_new_state_output(
+		msg, msg, &out, &invalidated_update_num,
+		&invalidated_annext_hint)) {
+		channel_internal_error(channel,
+				       "Invalid onchain new_state_output");
+	}
+
+	/* Populate state output hints for listpeers */
+	if (tal_count(invalidated_annext_hint) > 0) {
+		channel->onchain_state_outpoint = out;
+		channel->onchain_invalidated_update_num =
+		    invalidated_update_num;
+		tal_free(channel->onchain_invalidated_annex_hint);
+		channel->onchain_invalidated_annex_hint =
+		    tal_steal(channel, invalidated_annext_hint);
+	} else {
+		/* No annex hint means this is a committed_settle_tx rebind hint
+		 * only */
+		channel->onchain_committed_hint = out;
+	}
 }
 
 static void handle_onchain_unwatch_tx(struct channel *channel, const u8 *msg)
@@ -327,9 +395,11 @@ static void handle_missing_htlc_output(struct channel *channel, const u8 *msg)
 
 	/* We only set tell_if_missing on LOCAL htlcs */
 	if (htlc.owner != LOCAL) {
-		channel_internal_error(channel,
-				       "onchaind_missing_htlc_output: htlc %"PRIu64" is not local!",
-				       htlc.id);
+		channel_internal_error(
+		    channel,
+		    "onchaind_missing_htlc_output: htlc %" PRIu64
+		    " is not local!",
+		    htlc.id);
 		return;
 	}
 
@@ -343,7 +413,8 @@ static void handle_missing_htlc_output(struct channel *channel, const u8 *msg)
 	 *       corresponding to the HTLC.
 	 *       - MAY fail the corresponding incoming HTLC sooner.
 	 */
-	onchain_failed_our_htlc(channel, &htlc, "missing in commitment tx", false);
+	onchain_failed_our_htlc(channel, &htlc, "missing in commitment tx",
+				false);
 }
 
 static void handle_onchain_htlc_timeout(struct channel *channel, const u8 *msg)
@@ -358,7 +429,8 @@ static void handle_onchain_htlc_timeout(struct channel *channel, const u8 *msg)
 	/* It should tell us about timeouts on our LOCAL htlcs */
 	if (htlc.owner != LOCAL) {
 		channel_internal_error(channel,
-				       "onchaind_htlc_timeout: htlc %"PRIu64" is not local!",
+				       "onchaind_htlc_timeout: htlc %" PRIu64
+				       " is not local!",
 				       htlc.id);
 		return;
 	}
@@ -373,7 +445,8 @@ static void handle_onchain_htlc_timeout(struct channel *channel, const u8 *msg)
 	onchain_failed_our_htlc(channel, &htlc, "timed out", true);
 }
 
-static void handle_irrevocably_resolved(struct channel *channel, const u8 *msg UNUSED)
+static void handle_irrevocably_resolved(struct channel *channel,
+					const u8 *msg UNUSED)
 {
 	/* FIXME: Implement check_htlcs to ensure no dangling hout->in ptrs! */
 	free_htlcs(channel->peer->ld, channel);
@@ -383,7 +456,6 @@ static void handle_irrevocably_resolved(struct channel *channel, const u8 *msg U
 	/* This will also free onchaind. */
 	delete_channel(channel);
 }
-
 
 /**
  * onchain_add_utxo -- onchaind is telling us about an UTXO we own
@@ -399,9 +471,8 @@ static void onchain_add_utxo(struct channel *channel, const u8 *msg)
 	u8 *scriptPubkey;
 
 	if (!fromwire_onchaind_add_utxo(
-		tmpctx, msg, &outpoint, &commitment_point,
-		&amount, &blockheight, &scriptPubkey,
-		&csv_lock)) {
+		tmpctx, msg, &outpoint, &commitment_point, &amount,
+		&blockheight, &scriptPubkey, &csv_lock)) {
 		log_broken(channel->log,
 			   "onchaind gave invalid add_utxo message: %s",
 			   tal_hex(msg, msg));
@@ -415,16 +486,14 @@ static void onchain_add_utxo(struct channel *channel, const u8 *msg)
 		  type_to_string(tmpctx, struct bitcoin_outpoint, &outpoint),
 		  csv_lock);
 
-	wallet_add_onchaind_utxo(channel->peer->ld->wallet,
-				 &outpoint, scriptPubkey,
-				 blockheight, amount, channel,
-				 commitment_point,
-				 csv_lock);
+	wallet_add_onchaind_utxo(channel->peer->ld->wallet, &outpoint,
+				 scriptPubkey, blockheight, amount, channel,
+				 commitment_point, csv_lock);
 
-	mvt = new_coin_wallet_deposit(msg, &outpoint, blockheight,
-			              amount, DEPOSIT);
-	mvt->originating_acct = type_to_string(mvt, struct channel_id,
-					       &channel->cid);
+	mvt = new_coin_wallet_deposit(msg, &outpoint, blockheight, amount,
+				      DEPOSIT);
+	mvt->originating_acct =
+	    type_to_string(mvt, struct channel_id, &channel->cid);
 
 	notify_chain_mvt(channel->peer->ld, mvt);
 }
@@ -451,7 +520,7 @@ static void onchain_annotate_txin(struct channel *channel, const u8 *msg)
 		      "message: %s",
 		      tal_hex(msg, msg));
 	wallet_annotate_txin(channel->peer->ld->wallet, &txid, innum, type,
-				    channel->dbid);
+			     channel->dbid);
 }
 
 /* All onchaind-produced txs are actually of the same form: */
@@ -476,8 +545,7 @@ struct onchain_signing_info {
 	struct amount_sat out_sats;
 	u32 to_self_delay;
 	u32 locktime;
-	u8 *(*sign)(const tal_t *ctx,
-		    const struct bitcoin_tx *tx,
+	u8 *(*sign)(const tal_t *ctx, const struct bitcoin_tx *tx,
 		    const struct onchain_signing_info *info);
 
 	/* Information for consider_onchain_htlc_tx_rebroadcast */
@@ -527,100 +595,79 @@ static struct onchain_signing_info *new_signing_info(const tal_t *ctx,
 						     struct channel *channel,
 						     enum onchaind_wire msgtype)
 {
-	struct onchain_signing_info *info = tal(ctx, struct onchain_signing_info);
+	struct onchain_signing_info *info =
+	    tal(ctx, struct onchain_signing_info);
 	info->channel = channel;
 	info->msgtype = msgtype;
 	return info;
 }
 
-static u8 *sign_tx_to_us(const tal_t *ctx,
-			 const struct bitcoin_tx *tx,
+static u8 *sign_tx_to_us(const tal_t *ctx, const struct bitcoin_tx *tx,
 			 const struct onchain_signing_info *info)
 {
 	assert(info->msgtype == WIRE_ONCHAIND_SPEND_TO_US);
-	return towire_hsmd_sign_any_delayed_payment_to_us(ctx,
-							  info->u.htlc_timedout.commit_num,
-							  tx, info->wscript,
-							  0,
-							  &info->channel->peer->id,
-							  info->channel->dbid);
+	return towire_hsmd_sign_any_delayed_payment_to_us(
+	    ctx, info->u.htlc_timedout.commit_num, tx, info->wscript, 0,
+	    &info->channel->peer->id, info->channel->dbid);
 }
 
-static u8 *sign_penalty(const tal_t *ctx,
-			const struct bitcoin_tx *tx,
+static u8 *sign_penalty(const tal_t *ctx, const struct bitcoin_tx *tx,
 			const struct onchain_signing_info *info)
 {
 	assert(info->msgtype == WIRE_ONCHAIND_SPEND_PENALTY);
-	return towire_hsmd_sign_any_penalty_to_us(ctx,
-						  &info->u.spend_penalty.remote_per_commitment_secret,
-						  tx, info->wscript,
-						  0,
-						  &info->channel->peer->id,
-						  info->channel->dbid);
+	return towire_hsmd_sign_any_penalty_to_us(
+	    ctx, &info->u.spend_penalty.remote_per_commitment_secret, tx,
+	    info->wscript, 0, &info->channel->peer->id, info->channel->dbid);
 }
 
-static u8 *sign_htlc_success(const tal_t *ctx,
-			     const struct bitcoin_tx *tx,
+static u8 *sign_htlc_success(const tal_t *ctx, const struct bitcoin_tx *tx,
 			     const struct onchain_signing_info *info)
 {
-	const bool anchor_outputs = channel_type_has_anchors(info->channel->type);
+	const bool anchor_outputs =
+	    channel_type_has_anchors(info->channel->type);
 
 	assert(info->msgtype == WIRE_ONCHAIND_SPEND_HTLC_SUCCESS);
-	return towire_hsmd_sign_any_local_htlc_tx(ctx,
-						  info->u.htlc_success.commit_num,
-						  tx, info->wscript,
-						  anchor_outputs,
-						  0,
-						  &info->channel->peer->id,
-						  info->channel->dbid);
+	return towire_hsmd_sign_any_local_htlc_tx(
+	    ctx, info->u.htlc_success.commit_num, tx, info->wscript,
+	    anchor_outputs, 0, &info->channel->peer->id, info->channel->dbid);
 }
 
-static u8 *sign_htlc_timeout(const tal_t *ctx,
-			     const struct bitcoin_tx *tx,
+static u8 *sign_htlc_timeout(const tal_t *ctx, const struct bitcoin_tx *tx,
 			     const struct onchain_signing_info *info)
 {
-	const bool anchor_outputs = channel_type_has_anchors(info->channel->type);
+	const bool anchor_outputs =
+	    channel_type_has_anchors(info->channel->type);
 
 	assert(info->msgtype == WIRE_ONCHAIND_SPEND_HTLC_TIMEOUT);
-	return towire_hsmd_sign_any_local_htlc_tx(ctx,
-						  info->u.htlc_timeout.commit_num,
-						  tx, info->wscript,
-						  anchor_outputs,
-						  0,
-						  &info->channel->peer->id,
-						  info->channel->dbid);
+	return towire_hsmd_sign_any_local_htlc_tx(
+	    ctx, info->u.htlc_timeout.commit_num, tx, info->wscript,
+	    anchor_outputs, 0, &info->channel->peer->id, info->channel->dbid);
 }
 
-static u8 *sign_fulfill(const tal_t *ctx,
-			const struct bitcoin_tx *tx,
+static u8 *sign_fulfill(const tal_t *ctx, const struct bitcoin_tx *tx,
 			const struct onchain_signing_info *info)
 {
-	const bool anchor_outputs = channel_type_has_anchors(info->channel->type);
+	const bool anchor_outputs =
+	    channel_type_has_anchors(info->channel->type);
 
 	assert(info->msgtype == WIRE_ONCHAIND_SPEND_FULFILL);
-	return towire_hsmd_sign_any_remote_htlc_to_us(ctx,
-						      &info->u.fulfill.remote_per_commitment_point,
-						      tx, info->wscript,
-						      anchor_outputs,
-						      0,
-						      &info->channel->peer->id,
-						      info->channel->dbid);
+	return towire_hsmd_sign_any_remote_htlc_to_us(
+	    ctx, &info->u.fulfill.remote_per_commitment_point, tx,
+	    info->wscript, anchor_outputs, 0, &info->channel->peer->id,
+	    info->channel->dbid);
 }
 
-static u8 *sign_htlc_expired(const tal_t *ctx,
-			     const struct bitcoin_tx *tx,
+static u8 *sign_htlc_expired(const tal_t *ctx, const struct bitcoin_tx *tx,
 			     const struct onchain_signing_info *info)
 {
-	const bool anchor_outputs = channel_type_has_anchors(info->channel->type);
+	const bool anchor_outputs =
+	    channel_type_has_anchors(info->channel->type);
 
 	assert(info->msgtype == WIRE_ONCHAIND_SPEND_HTLC_EXPIRED);
-	return towire_hsmd_sign_any_remote_htlc_to_us(ctx,
-						      &info->u.htlc_expired.remote_per_commitment_point,
-						      tx, info->wscript,
-						      anchor_outputs,
-						      0,
-						      &info->channel->peer->id,
-						      info->channel->dbid);
+	return towire_hsmd_sign_any_remote_htlc_to_us(
+	    ctx, &info->u.htlc_expired.remote_per_commitment_point, tx,
+	    info->wscript, anchor_outputs, 0, &info->channel->peer->id,
+	    info->channel->dbid);
 }
 
 /* Matches bitcoin_witness_sig_and_element! */
@@ -628,15 +675,15 @@ static const struct onchain_witness_element **
 onchain_witness_sig_and_element(const tal_t *ctx, u8 **witness)
 {
 	struct onchain_witness_element **welements;
-	welements = tal_arr(ctx, struct onchain_witness_element *,
-			    tal_count(witness));
+	welements =
+	    tal_arr(ctx, struct onchain_witness_element *, tal_count(witness));
 
 	for (size_t i = 0; i < tal_count(welements); i++) {
 		welements[i] = tal(welements, struct onchain_witness_element);
 		/* See bitcoin_witness_sig_and_element */
 		welements[i]->is_signature = (i == 0);
-		welements[i]->witness = tal_dup_talarr(welements[i], u8,
-						       witness[i]);
+		welements[i]->witness =
+		    tal_dup_talarr(welements[i], u8, witness[i]);
 	}
 	return cast_const2(const struct onchain_witness_element **, welements);
 }
@@ -646,15 +693,16 @@ static const struct onchain_witness_element **
 onchain_witness_htlc_tx(const tal_t *ctx, u8 **witness)
 {
 	struct onchain_witness_element **welements;
-	welements = tal_arr(ctx, struct onchain_witness_element *,
-			    tal_count(witness));
+	welements =
+	    tal_arr(ctx, struct onchain_witness_element *, tal_count(witness));
 
 	for (size_t i = 0; i < tal_count(welements); i++) {
 		welements[i] = tal(welements, struct onchain_witness_element);
-		/* See bitcoin_witness_htlc_success_tx / bitcoin_witness_htlc_timeout_tx */
+		/* See bitcoin_witness_htlc_success_tx /
+		 * bitcoin_witness_htlc_timeout_tx */
 		welements[i]->is_signature = (i == 1 || i == 2);
-		welements[i]->witness = tal_dup_talarr(welements[i], u8,
-						       witness[i]);
+		welements[i]->witness =
+		    tal_dup_talarr(welements[i], u8, witness[i]);
 	}
 	return cast_const2(const struct onchain_witness_element **, welements);
 }
@@ -664,12 +712,11 @@ onchain_witness_htlc_tx(const tal_t *ctx, u8 **witness)
  * If worthwhile is not NULL, we set it to true normally, or false if
  * we had to lower fees so much it's unlikely to get mined
  * (i.e. "don't wait up!").
-*/
-static struct bitcoin_tx *onchaind_tx_unsigned(const tal_t *ctx,
-					       struct channel *channel,
-					       const struct onchain_signing_info *info,
-					       struct amount_sat *fee,
-					       bool *worthwhile)
+ */
+static struct bitcoin_tx *
+onchaind_tx_unsigned(const tal_t *ctx, struct channel *channel,
+		     const struct onchain_signing_info *info,
+		     struct amount_sat *fee, bool *worthwhile)
 {
 	struct bitcoin_tx *tx;
 	struct amount_sat amt;
@@ -680,27 +727,29 @@ static struct bitcoin_tx *onchaind_tx_unsigned(const tal_t *ctx,
 	struct lightningd *ld = channel->peer->ld;
 
 	bip32_pubkey(ld, &final_key, channel->final_key_idx);
-	if (bip32_key_from_parent(ld->bip32_base,
-				  channel->final_key_idx,
+	if (bip32_key_from_parent(ld->bip32_base, channel->final_key_idx,
 				  BIP32_FLAG_KEY_PUBLIC,
 				  &final_wallet_ext_key) != WALLY_OK) {
- 		channel_internal_error(channel,
-				       "Could not derive final_wallet_ext_key %"PRIu64,
-				       channel->final_key_idx);
+		channel_internal_error(
+		    channel, "Could not derive final_wallet_ext_key %" PRIu64,
+		    channel->final_key_idx);
 		return NULL;
 	}
 
 	tx = bitcoin_tx(ctx, chainparams, 1, 1, info->locktime);
-	bitcoin_tx_add_input(tx, &info->out, info->to_self_delay,
-			     NULL, info->out_sats, NULL, info->wscript);
+	bitcoin_tx_add_input(tx, &info->out, info->to_self_delay, NULL,
+			     info->out_sats, NULL, info->wscript);
 
 	/* FIXME should this be p2tr now? */
-	bitcoin_tx_add_output(
-	    tx, scriptpubkey_p2wpkh(tmpctx, &final_key), NULL, info->out_sats);
-	psbt_add_keypath_to_last_output(tx, channel->final_key_idx, &final_wallet_ext_key, false /* is_taproot */);
+	bitcoin_tx_add_output(tx, scriptpubkey_p2wpkh(tmpctx, &final_key), NULL,
+			      info->out_sats);
+	psbt_add_keypath_to_last_output(tx, channel->final_key_idx,
+					&final_wallet_ext_key,
+					false /* is_taproot */);
 
 	/* Worst-case sig is 73 bytes */
-	weight = bitcoin_tx_weight(tx) + 1 + 3 + 73 + 0 + tal_count(info->wscript);
+	weight =
+	    bitcoin_tx_weight(tx) + 1 + 3 + 73 + 0 + tal_count(info->wscript);
 	weight += elements_tx_overhead(chainparams, 1, 1);
 
 	block_target = info->deadline_block;
@@ -710,31 +759,34 @@ static struct bitcoin_tx *onchaind_tx_unsigned(const tal_t *ctx,
 		feerate = feerate_for_target(ld->topology, block_target);
 		*fee = amount_tx_fee(feerate, weight);
 
-		log_debug(channel->log,
-			  "Feerate for target %"PRIu64" (%+"PRId64" blocks) is %u, fee %s of %s",
-			  block_target,
-			  block_target - get_block_height(ld->topology),
-			  feerate,
-			  type_to_string(tmpctx, struct amount_sat, fee),
-			  type_to_string(tmpctx, struct amount_sat,
-					 &info->out_sats));
+		log_debug(
+		    channel->log,
+		    "Feerate for target %" PRIu64 " (%+" PRId64
+		    " blocks) is %u, fee %s of %s",
+		    block_target, block_target - get_block_height(ld->topology),
+		    feerate, type_to_string(tmpctx, struct amount_sat, fee),
+		    type_to_string(tmpctx, struct amount_sat, &info->out_sats));
 
 		/* If we can afford fee and it's not dust, we're done */
-		if (amount_sat_sub(&amt, info->out_sats, *fee)
-		    && amount_sat_greater_eq(amt, channel->our_config.dust_limit))
+		if (amount_sat_sub(&amt, info->out_sats, *fee) &&
+		    amount_sat_greater_eq(amt, channel->our_config.dust_limit))
 			break;
 
-		/* Hmm, can't afford with recommended fee.  Try increasing deadline! */
+		/* Hmm, can't afford with recommended fee.  Try increasing
+		 * deadline! */
 		block_target++;
 
-		/* If we can't even afford at FEERATE_FLOOR, something is wrong! */
+		/* If we can't even afford at FEERATE_FLOOR, something is wrong!
+		 */
 		if (feerate == FEERATE_FLOOR) {
 			amt = channel->our_config.dust_limit;
 			/* Not quite true, but Never Happens */
 			*fee = AMOUNT_SAT(0);
-			log_broken(channel->log, "TX can't afford minimal feerate"
-				   "; setting output to %s",
-				   type_to_string(tmpctx, struct amount_sat, &amt));
+			log_broken(
+			    channel->log,
+			    "TX can't afford minimal feerate"
+			    "; setting output to %s",
+			    type_to_string(tmpctx, struct amount_sat, &amt));
 			break;
 		}
 	}
@@ -744,21 +796,27 @@ static struct bitcoin_tx *onchaind_tx_unsigned(const tal_t *ctx,
 	if (worthwhile) {
 		*worthwhile = (block_target < info->deadline_block + (u64)20);
 		if (!*worthwhile) {
-			log_unusual(channel->log,
-				    "Lowballing feerate for %s sats from %u to %u (deadline %u->%"PRIu64"):"
-				    " won't count on it being spent!",
-				    type_to_string(tmpctx, struct amount_sat, &info->out_sats),
-				    feerate_for_target(ld->topology, info->deadline_block),
-				    feerate_for_target(ld->topology, block_target),
-				    info->deadline_block, block_target);
+			log_unusual(
+			    channel->log,
+			    "Lowballing feerate for %s sats from %u to %u "
+			    "(deadline %u->%" PRIu64 "):"
+			    " won't count on it being spent!",
+			    type_to_string(tmpctx, struct amount_sat,
+					   &info->out_sats),
+			    feerate_for_target(ld->topology,
+					       info->deadline_block),
+			    feerate_for_target(ld->topology, block_target),
+			    info->deadline_block, block_target);
 		}
 	}
 
 	/* If we came close to target, it's worthwhile to wait for. */
 	if (block_target != info->deadline_block)
-		log_debug(channel->log, "Had to adjust deadline from %u to %"PRIu64" for %s",
-			  info->deadline_block, block_target,
-			  type_to_string(tmpctx, struct amount_sat, &info->out_sats));
+		log_debug(
+		    channel->log,
+		    "Had to adjust deadline from %u to %" PRIu64 " for %s",
+		    info->deadline_block, block_target,
+		    type_to_string(tmpctx, struct amount_sat, &info->out_sats));
 	bitcoin_tx_output_set_amount(tx, 0, amt);
 	bitcoin_tx_finalize(tx);
 
@@ -787,12 +845,10 @@ static u8 **sign_and_get_witness(const tal_t *ctx,
  * it wasn't worthwhile at the given feerate (and it had to drop feerate).
  * Returns NULL iff it called channel_internal_error().
  */
-static struct bitcoin_tx *onchaind_tx(const tal_t *ctx,
-				      struct channel *channel,
-				      const struct onchain_signing_info *info,
-				      struct amount_sat *fee,
-				      bool *worthwhile,
-				      const struct onchain_witness_element ***welements)
+static struct bitcoin_tx *
+onchaind_tx(const tal_t *ctx, struct channel *channel,
+	    const struct onchain_signing_info *info, struct amount_sat *fee,
+	    bool *worthwhile, const struct onchain_witness_element ***welements)
 {
 	struct bitcoin_tx *tx;
 	u8 **witness;
@@ -833,16 +889,14 @@ static bool consider_onchain_rebroadcast(struct channel *channel,
 
 	/* Don't spam the logs! */
 	log_(channel->log,
-	     amount_sat_less_eq(newfee, info->fee) ? LOG_DBG : LOG_INFORM,
-	     NULL, false,
-	     "RBF onchain txid %s (fee %s) with txid %s (fee %s)",
+	     amount_sat_less_eq(newfee, info->fee) ? LOG_DBG : LOG_INFORM, NULL,
+	     false, "RBF onchain txid %s (fee %s) with txid %s (fee %s)",
 	     type_to_string(tmpctx, struct bitcoin_txid, &oldtxid),
 	     fmt_amount_sat(tmpctx, info->fee),
 	     type_to_string(tmpctx, struct bitcoin_txid, &newtxid),
 	     fmt_amount_sat(tmpctx, newfee));
 
-	log_debug(channel->log,
-		  "RBF %s->%s",
+	log_debug(channel->log, "RBF %s->%s",
 		  type_to_string(tmpctx, struct bitcoin_tx, *tx),
 		  type_to_string(tmpctx, struct bitcoin_tx, newtx));
 
@@ -854,9 +908,10 @@ static bool consider_onchain_rebroadcast(struct channel *channel,
 	return true;
 }
 
-static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
-						 const struct bitcoin_tx **tx,
-						 struct onchain_signing_info *info)
+static bool
+consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
+				     const struct bitcoin_tx **tx,
+				     struct onchain_signing_info *info)
 {
 	struct amount_sat change, excess;
 	struct utxo **utxos;
@@ -891,20 +946,16 @@ static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
 		return true;
 	}
 
-	utxos = wallet_utxo_boost(tmpctx,
-				  ld->wallet,
-				  get_block_height(ld->topology),
-				  bitcoin_tx_compute_fee(newtx),
-				  feerate,
-				  &weight);
+	utxos = wallet_utxo_boost(
+	    tmpctx, ld->wallet, get_block_height(ld->topology),
+	    bitcoin_tx_compute_fee(newtx), feerate, &weight);
 
 	/* Add those to create a new PSBT */
 	psbt = psbt_using_utxos(tmpctx, ld->wallet, utxos, locktime,
 				BITCOIN_TX_RBF_SEQUENCE, newtx->psbt);
 
 	/* Subtract how much we pay in fees for this tx, to calc excess. */
-	if (!amount_sat_sub(&excess,
-			    psbt_compute_fee(psbt),
+	if (!amount_sat_sub(&excess, psbt_compute_fee(psbt),
 			    amount_tx_fee(feerate, weight))) {
 		/* We didn't make the feerate.  Did we get nothing at all? */
 		if (tal_count(utxos) == 0) {
@@ -913,8 +964,9 @@ static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
 			return true;
 		}
 		/* At least we got something! */
-		log_unusual(channel->log,
-			    "We want to bump HTLC fee more, but ran out of funds!");
+		log_unusual(
+		    channel->log,
+		    "We want to bump HTLC fee more, but ran out of funds!");
 		excess = AMOUNT_SAT(0);
 	}
 
@@ -929,9 +981,8 @@ static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
 		/* Append change output. */
 		struct pubkey final_key;
 		bip32_pubkey(ld, &final_key, channel->final_key_idx);
-		psbt_append_output(psbt,
-				   scriptpubkey_p2wpkh(tmpctx, &final_key),
-				   change);
+		psbt_append_output(
+		    psbt, scriptpubkey_p2wpkh(tmpctx, &final_key), change);
 	}
 
 	/* Sanity check: are we paying more in fees than HTLC is worth? */
@@ -944,12 +995,9 @@ static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
 	}
 
 	/* Now, get HSM to sign off. */
-	msg = towire_hsmd_sign_htlc_tx_mingle(NULL,
-					      &channel->peer->id,
-					      channel->dbid,
-					      cast_const2(const struct utxo **,
-							  utxos),
-					      psbt);
+	msg = towire_hsmd_sign_htlc_tx_mingle(
+	    NULL, &channel->peer->id, channel->dbid,
+	    cast_const2(const struct utxo **, utxos), psbt);
 	msg = hsm_sync_req(tmpctx, ld, take(msg));
 	if (!fromwire_hsmd_sign_htlc_tx_mingle_reply(tmpctx, msg, &psbt))
 		fatal("Reading sign_htlc_tx_mingle_reply: %s",
@@ -973,9 +1021,8 @@ static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
 
 	/* Don't spam the logs! */
 	log_(channel->log,
-	     amount_sat_less_eq(newfee, oldfee) ? LOG_DBG : LOG_INFORM,
-	     NULL, false,
-	     "RBF HTLC txid %s (fee %s) with txid %s (fee %s)",
+	     amount_sat_less_eq(newfee, oldfee) ? LOG_DBG : LOG_INFORM, NULL,
+	     false, "RBF HTLC txid %s (fee %s) with txid %s (fee %s)",
 	     type_to_string(tmpctx, struct bitcoin_txid, &oldtxid),
 	     fmt_amount_sat(tmpctx, oldfee),
 	     type_to_string(tmpctx, struct bitcoin_txid, &newtxid),
@@ -993,7 +1040,8 @@ static u32 htlc_incoming_deadline(const struct channel *channel, u64 htlc_id)
 
 	hin = find_htlc_in(channel->peer->ld->htlcs_in, channel, htlc_id);
 	if (!hin) {
-		log_broken(channel->log, "No htlc IN %"PRIu64", using infinite deadline",
+		log_broken(channel->log,
+			   "No htlc IN %" PRIu64 ", using infinite deadline",
 			   htlc_id);
 		return infinite_block_deadline(channel->peer->ld->topology);
 	}
@@ -1003,13 +1051,15 @@ static u32 htlc_incoming_deadline(const struct channel *channel, u64 htlc_id)
 
 /* If there's a corresponding incoming HTLC, we want this mined in time so
  * we can fail incoming before incoming peer closes on us! */
-static u32 htlc_outgoing_incoming_deadline(const struct channel *channel, u64 htlc_id)
+static u32 htlc_outgoing_incoming_deadline(const struct channel *channel,
+					   u64 htlc_id)
 {
 	struct htlc_out *hout;
 
 	hout = find_htlc_out(channel->peer->ld->htlcs_out, channel, htlc_id);
 	if (!hout) {
-		log_broken(channel->log, "No htlc OUT %"PRIu64", using infinite deadline",
+		log_broken(channel->log,
+			   "No htlc OUT %" PRIu64 ", using infinite deadline",
 			   htlc_id);
 		return infinite_block_deadline(channel->peer->ld->topology);
 	}
@@ -1024,16 +1074,12 @@ static u32 htlc_outgoing_incoming_deadline(const struct channel *channel, u64 ht
 }
 
 /* Create the onchain tx and tell onchaind about it */
-static void create_onchain_tx(struct channel *channel,
-			      const struct bitcoin_outpoint *out,
-			      struct amount_sat out_sats,
-			      u32 to_self_delay,
-			      u32 locktime,
-			      u8 *(*sign)(const tal_t *ctx,
-					  const struct bitcoin_tx *tx,
-					  const struct onchain_signing_info *info),
-			      struct onchain_signing_info *info STEALS,
-			      const char *caller)
+static void
+create_onchain_tx(struct channel *channel, const struct bitcoin_outpoint *out,
+		  struct amount_sat out_sats, u32 to_self_delay, u32 locktime,
+		  u8 *(*sign)(const tal_t *ctx, const struct bitcoin_tx *tx,
+			      const struct onchain_signing_info *info),
+		  struct onchain_signing_info *info STEALS, const char *caller)
 {
 	struct bitcoin_tx *tx;
 	const struct onchain_witness_element **welements;
@@ -1048,7 +1094,8 @@ static void create_onchain_tx(struct channel *channel,
 	info->locktime = locktime;
 	info->sign = sign;
 
-	tx = onchaind_tx(tmpctx, channel, info, &info->fee, &worthwhile, &welements);
+	tx = onchaind_tx(tmpctx, channel, info, &info->fee, &worthwhile,
+			 &welements);
 	if (!tx) {
 		tal_free(info);
 		return;
@@ -1060,18 +1107,15 @@ static void create_onchain_tx(struct channel *channel,
 
 	/* We allow "excessive" fees, as we may be fighting with censors and
 	 * we'd rather spend fees than have our adversary win. */
-	broadcast_tx(channel, ld->topology,
-		     channel, take(tx), NULL, true, info->minblock,
-		     NULL, consider_onchain_rebroadcast, take(info));
+	broadcast_tx(channel, ld->topology, channel, take(tx), NULL, true,
+		     info->minblock, NULL, consider_onchain_rebroadcast,
+		     take(info));
 
-	subd_send_msg(channel->owner,
-		      take(towire_onchaind_spend_created(NULL,
-							 worthwhile,
-							 welements)));
+	subd_send_msg(channel->owner, take(towire_onchaind_spend_created(
+					  NULL, worthwhile, welements)));
 }
 
-static void handle_onchaind_spend_to_us(struct channel *channel,
-					const u8 *msg)
+static void handle_onchaind_spend_to_us(struct channel *channel, const u8 *msg)
 {
 	struct onchain_signing_info *info;
 	struct bitcoin_outpoint out;
@@ -1082,15 +1126,18 @@ static void handle_onchaind_spend_to_us(struct channel *channel,
 	/* BOLT #3:
 	 * #### `to_local` Output
 	 *...
-	 * The output is spent by an input with `nSequence` field set to `to_self_delay` (which can only be valid after that duration has passed) and witness:
- 	 *
+	 * The output is spent by an input with `nSequence` field set to
+	 *`to_self_delay` (which can only be valid after that duration has
+	 *passed) and witness:
+	 *
 	 *    <local_delayedsig> <>
 	 */
 
 	/* BOLT #3:
 	 * ## HTLC-Timeout and HTLC-Success Transactions
 	 *
-	 * These HTLC transactions are almost identical, except the HTLC-timeout transaction is timelocked.
+	 * These HTLC transactions are almost identical, except the HTLC-timeout
+	 *transaction is timelocked.
 	 *...
 	 * To spend this via penalty, the remote node uses a witness stack
 	 * `<revocationsig> 1`, and to collect the output, the local node uses
@@ -1099,22 +1146,21 @@ static void handle_onchaind_spend_to_us(struct channel *channel,
 	 */
 	info->stack_elem = NULL;
 
-	if (!fromwire_onchaind_spend_to_us(info, msg,
-					   &out, &out_sats,
-					   &info->minblock,
-					   &info->u.htlc_timedout.commit_num,
-					   &info->wscript)) {
-		channel_internal_error(channel, "Invalid onchaind_spend_to_us %s",
+	if (!fromwire_onchaind_spend_to_us(
+		info, msg, &out, &out_sats, &info->minblock,
+		&info->u.htlc_timedout.commit_num, &info->wscript)) {
+		channel_internal_error(channel,
+				       "Invalid onchaind_spend_to_us %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
 
 	/* No real deadline on this, it's just returning to our wallet. */
-	info->deadline_block = infinite_block_deadline(channel->peer->ld->topology);
+	info->deadline_block =
+	    infinite_block_deadline(channel->peer->ld->topology);
 	create_onchain_tx(channel, &out, out_sats,
 			  channel->channel_info.their_config.to_self_delay, 0,
-			  sign_tx_to_us, info,
-			  __func__);
+			  sign_tx_to_us, info, __func__);
 }
 
 static void handle_onchaind_spend_penalty(struct channel *channel,
@@ -1128,12 +1174,12 @@ static void handle_onchaind_spend_penalty(struct channel *channel,
 	info = new_signing_info(msg, channel, WIRE_ONCHAIND_SPEND_PENALTY);
 	/* We can always spend penalty txs immediately */
 	info->minblock = 0;
-	if (!fromwire_onchaind_spend_penalty(info, msg,
-					     &out, &out_sats,
-					     &info->u.spend_penalty.remote_per_commitment_secret,
-					     &stack_elem,
-					     &info->wscript)) {
-		channel_internal_error(channel, "Invalid onchaind_spend_penalty %s",
+	if (!fromwire_onchaind_spend_penalty(
+		info, msg, &out, &out_sats,
+		&info->u.spend_penalty.remote_per_commitment_secret,
+		&stack_elem, &info->wscript)) {
+		channel_internal_error(channel,
+				       "Invalid onchaind_spend_penalty %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
@@ -1143,11 +1189,9 @@ static void handle_onchaind_spend_penalty(struct channel *channel,
 	/* FIXME: deadline for HTLCs is actually a bit longer, but for
 	 * their output it's channel->our_config.to_self_delay after
 	 * the commitment tx is mined. */
-	info->deadline_block = *channel->close_blockheight
-		+ channel->our_config.to_self_delay;
-	create_onchain_tx(channel, &out, out_sats,
-			  0, 0,
-			  sign_penalty, info,
+	info->deadline_block =
+	    *channel->close_blockheight + channel->our_config.to_self_delay;
+	create_onchain_tx(channel, &out, out_sats, 0, 0, sign_penalty, info,
 			  __func__);
 }
 
@@ -1164,13 +1208,12 @@ static void handle_onchaind_spend_fulfill(struct channel *channel,
 	info = new_signing_info(msg, channel, WIRE_ONCHAIND_SPEND_FULFILL);
 	info->minblock = 0;
 
-	if (!fromwire_onchaind_spend_fulfill(info, msg,
-					     &out, &out_sats,
-					     &htlc_id,
-					     &info->u.fulfill.remote_per_commitment_point,
-					     &preimage,
-					     &info->wscript)) {
-		channel_internal_error(channel, "Invalid onchaind_spend_fulfill %s",
+	if (!fromwire_onchaind_spend_fulfill(
+		info, msg, &out, &out_sats, &htlc_id,
+		&info->u.fulfill.remote_per_commitment_point, &preimage,
+		&info->wscript)) {
+		channel_internal_error(channel,
+				       "Invalid onchaind_spend_fulfill %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
@@ -1182,11 +1225,8 @@ static void handle_onchaind_spend_fulfill(struct channel *channel,
 	 * Note that if `option_anchors` applies, the nSequence field of
 	 * the spending input must be `1`.
 	 */
-	create_onchain_tx(channel, &out, out_sats,
-			  anchor_outputs ? 1 : 0,
-			  0,
-			  sign_fulfill, info,
-			  __func__);
+	create_onchain_tx(channel, &out, out_sats, anchor_outputs ? 1 : 0, 0,
+			  sign_fulfill, info, __func__);
 }
 
 static void handle_onchaind_spend_htlc_success(struct channel *channel,
@@ -1202,21 +1242,22 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 	u8 **witness;
 	struct bitcoin_signature sig;
 	const struct onchain_witness_element **welements;
-	const bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
-	const bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
+	const bool option_anchor_outputs =
+	    channel_has(channel, OPT_ANCHOR_OUTPUTS);
+	const bool option_anchors_zero_fee_htlc_tx =
+	    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 
 	info = new_signing_info(msg, channel, WIRE_ONCHAIND_SPEND_HTLC_SUCCESS);
 	info->minblock = 0;
 
-	if (!fromwire_onchaind_spend_htlc_success(info, msg,
-						  &out, &out_sats, &fee,
-						  &htlc_id,
-						  &info->u.htlc_success.commit_num,
-						  &info->u.htlc_success.remote_htlc_sig,
-						  &info->u.htlc_success.preimage,
-						  &info->wscript,
-						  &htlc_wscript)) {
-		channel_internal_error(channel, "Invalid onchaind_spend_htlc_success %s",
+	if (!fromwire_onchaind_spend_htlc_success(
+		info, msg, &out, &out_sats, &fee, &htlc_id,
+		&info->u.htlc_success.commit_num,
+		&info->u.htlc_success.remote_htlc_sig,
+		&info->u.htlc_success.preimage, &info->wscript,
+		&htlc_wscript)) {
+		channel_internal_error(channel,
+				       "Invalid onchaind_spend_htlc_success %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
@@ -1224,12 +1265,14 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
-	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats, htlc_wscript, fee,
-		     0, option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
+	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats,
+		     htlc_wscript, fee, 0, option_anchor_outputs,
+		     option_anchors_zero_fee_htlc_tx);
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */
-		channel_internal_error(channel, "Invalid onchaind_spend_htlc_success %s",
+		channel_internal_error(channel,
+				       "Invalid onchaind_spend_htlc_success %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
@@ -1243,10 +1286,9 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 	if (!fromwire_hsmd_sign_tx_reply(msg, &sig))
 		fatal("Reading sign_tx_reply: %s", tal_hex(tmpctx, msg));
 
-	witness = bitcoin_witness_htlc_success_tx(NULL, &sig,
-						  &info->u.htlc_success.remote_htlc_sig,
-						  &info->u.htlc_success.preimage,
-						  info->wscript);
+	witness = bitcoin_witness_htlc_success_tx(
+	    NULL, &sig, &info->u.htlc_success.remote_htlc_sig,
+	    &info->u.htlc_success.preimage, info->wscript);
 	welements = onchain_witness_htlc_tx(tmpctx, witness);
 	bitcoin_tx_input_set_witness(tx, 0, take(witness));
 
@@ -1254,15 +1296,13 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 	info->out_sats = out_sats;
 
 	/* Immediately consider RBF. */
-	consider_onchain_htlc_tx_rebroadcast(channel,
-					     cast_const2(const struct bitcoin_tx **, &tx),
-					     info);
+	consider_onchain_htlc_tx_rebroadcast(
+	    channel, cast_const2(const struct bitcoin_tx **, &tx), info);
 
 	log_debug(channel->log, "Broadcast for onchaind tx %s",
 		  type_to_string(tmpctx, struct bitcoin_tx, tx));
-	broadcast_tx(channel, channel->peer->ld->topology,
-		     channel, take(tx), NULL, false,
-		     info->minblock, NULL,
+	broadcast_tx(channel, channel->peer->ld->topology, channel, take(tx),
+		     NULL, false, info->minblock, NULL,
 		     consider_onchain_htlc_tx_rebroadcast, take(info));
 
 	msg = towire_onchaind_spend_created(NULL, true, welements);
@@ -1283,20 +1323,20 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	u8 **witness;
 	struct bitcoin_signature sig;
 	const struct onchain_witness_element **welements;
-	const bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
-	const bool option_anchors_zero_fee_htlc_tx = channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
+	const bool option_anchor_outputs =
+	    channel_has(channel, OPT_ANCHOR_OUTPUTS);
+	const bool option_anchors_zero_fee_htlc_tx =
+	    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
 
 	info = new_signing_info(msg, channel, WIRE_ONCHAIND_SPEND_HTLC_TIMEOUT);
 
-	if (!fromwire_onchaind_spend_htlc_timeout(info, msg,
-						  &out, &out_sats, &fee,
-						  &htlc_id,
-						  &cltv_expiry,
-						  &info->u.htlc_timeout.commit_num,
-						  &info->u.htlc_timeout.remote_htlc_sig,
-						  &info->wscript,
-						  &htlc_wscript)) {
-		channel_internal_error(channel, "Invalid onchaind_spend_htlc_timeout %s",
+	if (!fromwire_onchaind_spend_htlc_timeout(
+		info, msg, &out, &out_sats, &fee, &htlc_id, &cltv_expiry,
+		&info->u.htlc_timeout.commit_num,
+		&info->u.htlc_timeout.remote_htlc_sig, &info->wscript,
+		&htlc_wscript)) {
+		channel_internal_error(channel,
+				       "Invalid onchaind_spend_htlc_timeout %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
@@ -1304,19 +1344,22 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
-	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats, htlc_wscript, fee,
-		     cltv_expiry, option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
+	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats,
+		     htlc_wscript, fee, cltv_expiry, option_anchor_outputs,
+		     option_anchors_zero_fee_htlc_tx);
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */
-		channel_internal_error(channel, "Invalid onchaind_spend_htlc_timeout %s",
+		channel_internal_error(channel,
+				       "Invalid onchaind_spend_htlc_timeout %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
 
 	/* FIXME: tell onchaind if HTLC is too small for current
 	 * feerate! */
-	info->deadline_block = htlc_outgoing_incoming_deadline(channel, htlc_id);
+	info->deadline_block =
+	    htlc_outgoing_incoming_deadline(channel, htlc_id);
 
 	/* nLocktime: we have to be *after* that block! */
 	info->minblock = cltv_expiry + 1;
@@ -1326,9 +1369,8 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	if (!fromwire_hsmd_sign_tx_reply(msg, &sig))
 		fatal("Reading sign_tx_reply: %s", tal_hex(tmpctx, msg));
 
-	witness = bitcoin_witness_htlc_timeout_tx(NULL, &sig,
-						  &info->u.htlc_timeout.remote_htlc_sig,
-						  info->wscript);
+	witness = bitcoin_witness_htlc_timeout_tx(
+	    NULL, &sig, &info->u.htlc_timeout.remote_htlc_sig, info->wscript);
 	welements = onchain_witness_htlc_tx(tmpctx, witness);
 	bitcoin_tx_input_set_witness(tx, 0, take(witness));
 
@@ -1336,15 +1378,13 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	info->out_sats = out_sats;
 
 	/* Immediately consider RBF. */
-	consider_onchain_htlc_tx_rebroadcast(channel,
-					     cast_const2(const struct bitcoin_tx **, &tx),
-					     info);
+	consider_onchain_htlc_tx_rebroadcast(
+	    channel, cast_const2(const struct bitcoin_tx **, &tx), info);
 
 	log_debug(channel->log, "Broadcast for onchaind tx %s",
 		  type_to_string(tmpctx, struct bitcoin_tx, tx));
-	broadcast_tx(channel, channel->peer->ld->topology,
-		     channel, take(tx), NULL, false,
-		     info->minblock, NULL,
+	broadcast_tx(channel, channel->peer->ld->topology, channel, take(tx),
+		     NULL, false, info->minblock, NULL,
 		     consider_onchain_htlc_tx_rebroadcast, take(info));
 
 	msg = towire_onchaind_spend_created(NULL, true, welements);
@@ -1375,13 +1415,12 @@ static void handle_onchaind_spend_htlc_expired(struct channel *channel,
 	 */
 	info->stack_elem = NULL;
 
-	if (!fromwire_onchaind_spend_htlc_expired(info, msg,
-						  &out, &out_sats,
-						  &htlc_id,
-						  &cltv_expiry,
-						  &info->u.htlc_expired.remote_per_commitment_point,
-						  &info->wscript)) {
-		channel_internal_error(channel, "Invalid onchaind_spend_htlc_expired %s",
+	if (!fromwire_onchaind_spend_htlc_expired(
+		info, msg, &out, &out_sats, &htlc_id, &cltv_expiry,
+		&info->u.htlc_expired.remote_per_commitment_point,
+		&info->wscript)) {
+		channel_internal_error(channel,
+				       "Invalid onchaind_spend_htlc_expired %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
@@ -1390,15 +1429,14 @@ static void handle_onchaind_spend_htlc_expired(struct channel *channel,
 	info->minblock = cltv_expiry + 1;
 
 	/* We have to spend it before we can close incoming */
-	info->deadline_block = htlc_outgoing_incoming_deadline(channel, htlc_id);
-	create_onchain_tx(channel, &out, out_sats,
-			  anchor_outputs ? 1 : 0,
-			  cltv_expiry,
-			  sign_htlc_expired, info,
-			  __func__);
+	info->deadline_block =
+	    htlc_outgoing_incoming_deadline(channel, htlc_id);
+	create_onchain_tx(channel, &out, out_sats, anchor_outputs ? 1 : 0,
+			  cltv_expiry, sign_htlc_expired, info, __func__);
 }
 
-static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds UNUSED)
+static unsigned int onchain_msg(struct subd *sd, const u8 *msg,
+				const int *fds UNUSED)
 {
 	enum onchaind_wire t = fromwire_peektype(msg);
 
@@ -1411,7 +1449,7 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds U
 		handle_onchain_unwatch_tx(sd->channel, msg);
 		break;
 
- 	case WIRE_ONCHAIND_EXTRACTED_PREIMAGE:
+	case WIRE_ONCHAIND_EXTRACTED_PREIMAGE:
 		handle_extracted_preimage(sd->channel, msg);
 		break;
 
@@ -1477,18 +1515,82 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds U
 	case WIRE_ONCHAIND_DEV_MEMLEAK:
 	case WIRE_ONCHAIND_DEV_MEMLEAK_REPLY:
 		break;
+	/* These are illegal */
+	case WIRE_ELTOO_ONCHAIND_INIT:
+	case WIRE_ELTOO_ONCHAIND_INIT_REPLY:
+	case WIRE_ELTOO_ONCHAIND_NEW_STATE_OUTPUT:
+		abort();
+	}
+
+	return 0;
+}
+
+/* FIXME if init is the only difference let's de-duplicate */
+static unsigned int eltoo_onchain_msg(struct subd *sd, const u8 *msg,
+				      const int *fds UNUSED)
+{
+	enum onchaind_wire t = fromwire_peektype(msg);
+
+	switch (t) {
+		/* Only things changed... */
+	case WIRE_ELTOO_ONCHAIND_INIT_REPLY:
+		handle_eltoo_onchain_init_reply(sd->channel, msg);
+		break;
+		/* End Eltoo-related changes */
+	case WIRE_ONCHAIND_ALL_IRREVOCABLY_RESOLVED:
+		handle_irrevocably_resolved(sd->channel, msg);
+		break;
+	case WIRE_ONCHAIND_NOTIFY_COIN_MVT:
+		handle_onchain_log_coin_move(sd->channel, msg);
+		break;
+	case WIRE_ONCHAIND_BROADCAST_TX:
+		handle_onchain_broadcast_tx(sd->channel, msg);
+		break;
+	case WIRE_ONCHAIND_UNWATCH_TX:
+		handle_onchain_unwatch_tx(sd->channel, msg);
+		break;
+	case WIRE_ONCHAIND_ANNOTATE_TXIN:
+		onchain_annotate_txin(sd->channel, msg);
+		break;
+	case WIRE_ONCHAIND_ANNOTATE_TXOUT:
+		onchain_annotate_txout(sd->channel, msg);
+		break;
+	case WIRE_ELTOO_ONCHAIND_NEW_STATE_OUTPUT:
+		handle_new_state_output(sd->channel, msg);
+		break;
+	case WIRE_ONCHAIND_HTLC_TIMEOUT:
+		/* FIXME what needs to change for handling? */
+		handle_onchain_htlc_timeout(sd->channel, msg);
+		break;
+	case WIRE_ONCHAIND_EXTRACTED_PREIMAGE:
+		handle_extracted_preimage(sd->channel, msg);
+		break;
+	case WIRE_ONCHAIND_MISSING_HTLC_OUTPUT:
+	case WIRE_ONCHAIND_ADD_UTXO:
+		/* FIXME implement */
+		abort();
+	/* We send these, not receive them */
+	case WIRE_ONCHAIND_INIT:
+	case WIRE_ONCHAIND_SPENT:
+	case WIRE_ONCHAIND_DEPTH:
+	case WIRE_ONCHAIND_HTLCS:
+	case WIRE_ONCHAIND_KNOWN_PREIMAGE:
+	case WIRE_ONCHAIND_DEV_MEMLEAK:
+	case WIRE_ONCHAIND_DEV_MEMLEAK_REPLY:
+	case WIRE_ELTOO_ONCHAIND_INIT:
+		break;
+	/* These are illegal */
+	case WIRE_ONCHAIND_INIT_REPLY:
+		abort();
 	}
 
 	return 0;
 }
 
 /* Only error onchaind can get is if it dies. */
-static void onchain_error(struct channel *channel,
-			  struct peer_fd *pps UNUSED,
-			  const char *desc,
-			  const u8 *err_for_them UNUSED,
-			  bool disconnect UNUSED,
-			  bool warning UNUSED)
+static void onchain_error(struct channel *channel, struct peer_fd *pps UNUSED,
+			  const char *desc, const u8 *err_for_them UNUSED,
+			  bool disconnect UNUSED, bool warning UNUSED)
 {
 	channel_set_owner(channel, NULL);
 
@@ -1507,6 +1609,10 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 					 const struct bitcoin_tx *tx,
 					 u32 blockheight)
 {
+	if (channel->our_config.is_eltoo) {
+		return eltoo_onchaind_funding_spent(channel, tx, blockheight);
+	}
+
 	u8 *msg;
 	struct bitcoin_txid our_last_txid;
 	struct lightningd *ld = channel->peer->ld;
@@ -1517,10 +1623,9 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 	/* use REASON_ONCHAIN or closer's reason, if known */
 	reason = REASON_ONCHAIN;
 	if (channel->closer != NUM_SIDES)
-		reason = REASON_UNKNOWN;  /* will use last cause as reason */
+		reason = REASON_UNKNOWN; /* will use last cause as reason */
 
-	channel_fail_permanent(channel, reason,
-			       "Funding transaction spent");
+	channel_fail_permanent(channel, reason, "Funding transaction spent");
 
 	/* If we haven't posted the open event yet, post an open */
 	if (!channel->scid || !channel->remote_channel_ready) {
@@ -1536,28 +1641,19 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 
 	/* We could come from almost any state. */
 	/* NOTE(mschmoock) above comment is wrong, since we failed above! */
-	channel_set_state(channel,
-			  channel->state,
-			  FUNDING_SPEND_SEEN,
-			  reason,
+	channel_set_state(channel, channel->state, FUNDING_SPEND_SEEN, reason,
 			  tal_fmt(tmpctx, "Onchain funding spend"));
 
-	hsmfd = hsm_get_client_fd(ld, &channel->peer->id,
-				  channel->dbid,
-				  HSM_PERM_SIGN_ONCHAIN_TX
-				  | HSM_PERM_COMMITMENT_POINT);
+	hsmfd = hsm_get_client_fd(ld, &channel->peer->id, channel->dbid,
+				  HSM_PERM_SIGN_ONCHAIN_TX |
+				      HSM_PERM_COMMITMENT_POINT);
 
-	channel_set_owner(channel, new_channel_subd(channel, ld,
-						    "lightning_onchaind",
-						    channel,
-						    &channel->peer->id,
-						    channel->log, false,
-						    onchaind_wire_name,
-						    onchain_msg,
-						    onchain_error,
-						    channel_set_billboard,
-						    take(&hsmfd),
-						    NULL));
+	channel_set_owner(
+	    channel,
+	    new_channel_subd(channel, ld, "lightning_onchaind", channel,
+			     &channel->peer->id, channel->log, false,
+			     onchaind_wire_name, onchain_msg, onchain_error,
+			     channel_set_billboard, take(&hsmfd), NULL));
 
 	if (!channel->owner) {
 		log_broken(channel->log, "Could not subdaemon onchain: %s",
@@ -1568,12 +1664,11 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 	bip32_pubkey(ld, &final_key, channel->final_key_idx);
 
 	struct ext_key final_wallet_ext_key;
-	if (bip32_key_from_parent(
-		    ld->bip32_base,
-		    channel->final_key_idx,
-		    BIP32_FLAG_KEY_PUBLIC,
-		    &final_wallet_ext_key) != WALLY_OK) {
-		log_broken(channel->log, "Could not derive final_wallet_ext_key %"PRIu64,
+	if (bip32_key_from_parent(ld->bip32_base, channel->final_key_idx,
+				  BIP32_FLAG_KEY_PUBLIC,
+				  &final_wallet_ext_key) != WALLY_OK) {
+		log_broken(channel->log,
+			   "Could not derive final_wallet_ext_key %" PRIu64,
 			   channel->final_key_idx);
 		return KEEP_WATCHING;
 	}
@@ -1583,56 +1678,123 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 	if (!is_stub_scid(channel->scid))
 		bitcoin_txid(channel->last_tx, &our_last_txid);
 	else
-	/* Dummy txid for stub channel to make valgrind happy. */
+		/* Dummy txid for stub channel to make valgrind happy. */
 		bitcoin_txid_from_hex("80cea306607b708a03a1854520729d"
-				"a884e4317b7b51f3d4a622f88176f5e034",
-				64,
-				&our_last_txid);
+				      "a884e4317b7b51f3d4a622f88176f5e034",
+				      64, &our_last_txid);
 
-	log_debug(channel->log, "channel->static_remotekey_start[LOCAL] %"PRIu64,
+	log_debug(channel->log,
+		  "channel->static_remotekey_start[LOCAL] %" PRIu64,
 		  channel->static_remotekey_start[LOCAL]);
 
-	msg = towire_onchaind_init(channel,
-				  &channel->their_shachain.chain,
-				  chainparams,
-				  channel->funding_sats,
-				  channel->our_msat,
-				  &channel->channel_info.old_remote_per_commit,
-				  &channel->channel_info.remote_per_commit,
-				   /* BOLT #2:
-				    * `to_self_delay` is the number of blocks
-				    * that the other node's to-self outputs
-				    * must be delayed */
-				   /* So, these are reversed: they specify ours,
-				    * we specify theirs. */
-				  channel->channel_info.their_config.to_self_delay,
-				  channel->our_config.to_self_delay,
-				  channel->our_config.dust_limit,
-				  &our_last_txid,
-				  channel->shutdown_scriptpubkey[LOCAL],
-				  channel->shutdown_scriptpubkey[REMOTE],
-				  channel->final_key_idx,
-				  &final_wallet_ext_key,
-				  &final_key,
-				  channel->opener,
-				  &channel->local_basepoints,
-				  &channel->channel_info.theirbase,
-				  tx_parts_from_wally_tx(tmpctx, tx->wtx, -1, -1),
-				  tx->wtx->locktime,
-				  blockheight,
-				  /* FIXME: config for 'reasonable depth' */
-				  3,
-				  channel->last_htlc_sigs,
-				  channel->min_possible_feerate,
-				  channel->max_possible_feerate,
-				  channel->future_per_commitment_point,
-				  &channel->local_funding_pubkey,
-				  &channel->channel_info.remote_fundingkey,
-				  channel->static_remotekey_start[LOCAL],
-				  channel->static_remotekey_start[REMOTE],
-				   channel_has(channel, OPT_ANCHOR_OUTPUTS),
-				   channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
-				  feerate_min(ld, NULL));
+	msg = towire_onchaind_init(
+	    channel, &channel->their_shachain.chain, chainparams,
+	    channel->funding_sats, channel->our_msat,
+	    &channel->channel_info.old_remote_per_commit,
+	    &channel->channel_info.remote_per_commit,
+	    /* BOLT #2:
+	     * `to_self_delay` is the number of blocks
+	     * that the other node's to-self outputs
+	     * must be delayed */
+	    /* So, these are reversed: they specify ours,
+	     * we specify theirs. */
+	    channel->channel_info.their_config.to_self_delay,
+	    channel->our_config.to_self_delay, channel->our_config.dust_limit,
+	    &our_last_txid, channel->shutdown_scriptpubkey[LOCAL],
+	    channel->shutdown_scriptpubkey[REMOTE], channel->final_key_idx,
+	    &final_wallet_ext_key, &final_key, channel->opener,
+	    &channel->local_basepoints, &channel->channel_info.theirbase,
+	    tx_parts_from_wally_tx(tmpctx, tx->wtx, -1, -1), tx->wtx->locktime,
+	    blockheight,
+	    /* FIXME: config for 'reasonable depth' */
+	    3, channel->last_htlc_sigs, channel->min_possible_feerate,
+	    channel->max_possible_feerate, channel->future_per_commitment_point,
+	    &channel->local_funding_pubkey,
+	    &channel->channel_info.remote_fundingkey,
+	    channel->static_remotekey_start[LOCAL],
+	    channel->static_remotekey_start[REMOTE],
+	    channel_has(channel, OPT_ANCHOR_OUTPUTS),
+	    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+	    feerate_min(ld, NULL));
+	subd_send_msg(channel->owner, take(msg));
+
+	watch_tx_and_outputs(channel, tx);
+
+	/* We keep watching until peer finally deleted, for reorgs. */
+	return KEEP_WATCHING;
+}
+
+/* With a reorg, this can get called multiple times; each time we'll kill
+ * onchaind (like any other owner), and restart */
+enum watch_result eltoo_onchaind_funding_spent(struct channel *channel,
+					       const struct bitcoin_tx *tx,
+					       u32 blockheight)
+{
+	u8 *msg;
+	struct lightningd *ld = channel->peer->ld;
+	int hsmfd;
+	enum state_change reason;
+	u32 htlc_feerate;
+
+	/* use REASON_ONCHAIN or closer's reason, if known */
+	reason = REASON_ONCHAIN;
+	if (channel->closer != NUM_SIDES)
+		reason = REASON_UNKNOWN; /* will use last cause as reason */
+
+	channel_fail_permanent(channel, reason, "Funding transaction spent");
+
+	/* We could come from almost any state. */
+	/* NOTE(mschmoock) above comment is wrong, since we failed above! */
+	channel_set_state(channel, channel->state, FUNDING_SPEND_SEEN, reason,
+			  "Onchain funding spend");
+
+	hsmfd = hsm_get_client_fd(ld, &channel->peer->id, channel->dbid,
+				  HSM_CAP_SIGN_ONCHAIN_TX |
+				      HSM_CAP_COMMITMENT_POINT);
+
+	channel_set_owner(
+	    channel,
+	    new_channel_subd(channel, ld, "lightning_eltoo_onchaind", channel,
+			     &channel->peer->id, channel->log, false,
+			     onchaind_wire_name, /* N.B. Reusing onchaind */
+			     eltoo_onchain_msg, onchain_error,
+			     channel_set_billboard, take(&hsmfd), NULL));
+
+	if (!channel->owner) {
+		log_broken(channel->log, "Could not subdaemon onchain: %s",
+			   strerror(errno));
+		return KEEP_WATCHING;
+	}
+
+	htlc_feerate = htlc_resolution_feerate(ld->topology);
+	/* Unlike classic LN, we don't have any transactions sitting around to
+	 * harvest feerates from */
+	if (htlc_feerate == 0) {
+		log_unusual(ld->log, "Could not retrieve valid htlc resolution "
+				     "feerate for eltoo_onchaind. Continuing.");
+		/* FIXME we should guess better, at least take mempool min fee
+		 * into account? Or figure out better fix */
+		htlc_feerate = 250 * 5; /* default mempool min times 5 */
+	}
+
+	/* Add HTLCs to init, since we know which HTLCs will be exposed */
+	msg = towire_eltoo_onchaind_init(
+	    channel, chainparams, &channel->funding, channel->funding_sats,
+	    tx_parts_from_wally_tx(tmpctx, tx->wtx, -1, -1), tx->wtx->locktime,
+	    channel->eltoo_keyset.complete_update_tx,
+	    channel->eltoo_keyset.complete_settle_tx,
+	    channel->eltoo_keyset.committed_update_tx,
+	    channel->eltoo_keyset.committed_settle_tx, blockheight,
+	    channel->our_msat, htlc_feerate, channel->our_config.dust_limit,
+	    channel->shutdown_scriptpubkey[LOCAL],
+	    channel->shutdown_scriptpubkey[REMOTE],
+	    &channel->local_funding_pubkey,
+	    &channel->channel_info.remote_fundingkey,
+	    &channel->local_basepoints.payment /* settlement key */,
+	    &channel->channel_info.theirbase.payment /* settlement key */,
+	    &channel->eltoo_keyset.last_complete_state.self_psig,
+	    &channel->eltoo_keyset.last_complete_state.other_psig,
+	    &channel->eltoo_keyset.last_complete_state.session);
 	subd_send_msg(channel->owner, take(msg));
 
 	watch_tx_and_outputs(channel, tx);

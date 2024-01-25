@@ -67,6 +67,7 @@ msgdata,onchaind_htlcs,tell_immediately,bool,num_htlcs
 # master->onchaind: Notifier that an output has been spent by input_num of tx.
 msgtype,onchaind_spent,5004
 msgdata,onchaind_spent,tx,tx_parts,
+msgdata,onchaind_spent,locktime,u32,
 msgdata,onchaind_spent,input_num,u32,
 msgdata,onchaind_spent,blockheight,u32,
 
@@ -208,3 +209,42 @@ msgtype,onchaind_spend_created,5140
 msgdata,onchaind_spend_created,expect_to_succeed,bool,
 msgdata,onchaind_spend_created,num_witnesses,u32,
 msgdata,onchaind_spend_created,witness,onchain_witness_element,num_witnesses
+
+# Eltoo stuff following
+msgtype,eltoo_onchaind_init,5061
+msgdata,eltoo_onchaind_init,chainparams,chainparams,
+msgdata,eltoo_onchaind_init,funding_outpoint,bitcoin_outpoint,
+msgdata,eltoo_onchaind_init,funding_amount_satoshi,amount_sat,
+msgdata,eltoo_onchaind_init,tx_parts,tx_parts,
+msgdata,eltoo_onchaind_init,locktime,u32,
+msgdata,eltoo_onchaind_init,complete_update_tx,bitcoin_tx,
+msgdata,eltoo_onchaind_init,complete_settle_tx,bitcoin_tx,
+msgdata,eltoo_onchaind_init,committed_update_tx,?bitcoin_tx,
+msgdata,eltoo_onchaind_init,committed_settle_tx,?bitcoin_tx,
+msgdata,eltoo_onchaind_init,tx_blockheight,u32,
+msgdata,eltoo_onchaind_init,our_msat,amount_msat,
+msgdata,eltoo_onchaind_init,htlc_feerate,u32,
+msgdata,eltoo_onchaind_init,local_dust_limit_satoshi,amount_sat,
+msgdata,eltoo_onchaind_init,local_scriptpubkey_len,u16,
+msgdata,eltoo_onchaind_init,local_scriptpubkey,u8,local_scriptpubkey_len
+msgdata,eltoo_onchaind_init,remote_scriptpubkey_len,u16,
+msgdata,eltoo_onchaind_init,remote_scriptpubkey,u8,remote_scriptpubkey_len
+msgdata,eltoo_onchaind_init,self_funding_key,pubkey,
+msgdata,eltoo_onchaind_init,other_funding_key,pubkey,
+msgdata,eltoo_onchaind_init,self_settle_key,pubkey,
+msgdata,eltoo_onchaind_init,other_settle_key,pubkey,
+msgdata,eltoo_onchaind_init,complete_self_psig,partial_sig,
+msgdata,eltoo_onchaind_init,complete_other_psig,partial_sig,
+msgdata,eltoo_onchaind_init,complete_session,musig_session,
+
+
+# This says we're ready; give us htlcs and preimages.
+msgtype,eltoo_onchaind_init_reply,5161
+
+# onchaind->master: Notifier that a new state output has been created, used
+# for debugging purposes
+msgtype,eltoo_onchaind_new_state_output,5062
+msgdata,eltoo_onchaind_new_state_output,new_prevout,bitcoin_outpoint,
+msgdata,eltoo_onchaind_new_state_output,invalidated_update_num,u32,
+msgdata,eltoo_onchaind_new_state_output,annex_hint_len,u16,
+msgdata,eltoo_onchaind_new_state_output,invalidated_annex_hint,u8,annex_hint_len

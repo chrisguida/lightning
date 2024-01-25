@@ -5,6 +5,7 @@
 #include <common/channel_id.h>
 #include <common/channel_type.h>
 #include <common/derive_basepoints.h>
+#include <common/keyset.h>
 #include <common/scb_wiregen.h>
 #include <common/tx_roles.h>
 #include <common/utils.h>
@@ -21,13 +22,14 @@ struct channel_info {
 	struct pubkey remote_fundingkey;
 	struct basepoints theirbase;
 	/* The old_remote_per_commit is for the locked-in remote commit_tx,
-	 * and the remote_per_commit is for the commit_tx we're modifying now. */
+	 * and the remote_per_commit is for the commit_tx we're modifying now.
+	 */
 	struct pubkey remote_per_commit, old_remote_per_commit;
 };
 
 struct billboard {
 	/* Status information to display on listpeers */
-	const char *permanent[CHANNEL_STATE_MAX+1];
+	const char *permanent[CHANNEL_STATE_MAX + 1];
 	const char *transient;
 };
 
@@ -132,8 +134,8 @@ struct channel {
 	/* Their shachain. */
 	struct wallet_shachain their_shachain;
 
- 	/* What's happening. */
- 	enum channel_state state;
+	/* What's happening. */
+	enum channel_state state;
 
 	/* Which side offered channel? */
 	enum side opener;
@@ -200,6 +202,17 @@ struct channel {
 	struct bitcoin_tx *last_tx;
 	struct bitcoin_signature last_sig;
 	const struct bitcoin_signature *last_htlc_sigs;
+
+	/* Eltoo-only fields */
+	/* Stores "last" psigs, session */
+	struct eltoo_keyset eltoo_keyset;
+
+	/* Cache of state output information reported by eltoo_onchaind */
+	struct bitcoin_outpoint onchain_state_outpoint;
+	u32 onchain_invalidated_update_num;
+	u8 *onchain_invalidated_annex_hint;
+	/* Only for rebinding committed settle tx if it exists */
+	struct bitcoin_outpoint onchain_committed_hint;
 
 	/* Keys for channel */
 	struct channel_info channel_info;
@@ -316,104 +329,82 @@ struct channel {
 bool channel_is_connected(const struct channel *channel);
 
 /* For v2 opens, a channel that has not yet been committed/saved to disk */
-struct channel *new_unsaved_channel(struct peer *peer,
-				    u32 feerate_base,
+struct channel *new_unsaved_channel(struct peer *peer, u32 feerate_base,
 				    u32 feerate_ppm);
 
 struct open_attempt *new_channel_open_attempt(struct channel *channel);
 
-struct channel *new_channel(struct peer *peer, u64 dbid,
-			    /* NULL or stolen */
-			    struct wallet_shachain *their_shachain STEALS,
-			    enum channel_state state,
-			    enum side opener,
-			    /* NULL or stolen */
-			    struct logger *log STEALS,
-			    const char *transient_billboard TAKES,
-			    u8 channel_flags,
-			    bool req_confirmed_ins_local,
-			    bool req_confirmed_ins_remote,
-			    const struct channel_config *our_config,
-			    u32 minimum_depth,
-			    u64 next_index_local,
-			    u64 next_index_remote,
-			    u64 next_htlc_id,
-			    const struct bitcoin_outpoint *funding,
-			    struct amount_sat funding_sats,
-			    struct amount_msat push,
-			    struct amount_sat our_funds,
-			    bool remote_channel_ready,
-			    /* NULL or stolen */
-			    struct short_channel_id *scid STEALS,
-			    struct short_channel_id *alias_local STEALS,
-			    struct short_channel_id *alias_remote STEALS,
-			    struct channel_id *cid,
-			    struct amount_msat our_msatoshi,
-			    struct amount_msat msatoshi_to_us_min,
-			    struct amount_msat msatoshi_to_us_max,
-			    struct bitcoin_tx *last_tx STEALS,
-			    const struct bitcoin_signature *last_sig,
-			    /* NULL or stolen */
-			    const struct bitcoin_signature *last_htlc_sigs STEALS,
-			    const struct channel_info *channel_info,
-			    const struct fee_states *fee_states TAKES,
-			    /* NULL or stolen */
-			    u8 *remote_shutdown_scriptpubkey STEALS,
-			    const u8 *local_shutdown_scriptpubkey,
-			    u64 final_key_idx,
-			    bool last_was_revoke,
-			    /* NULL or stolen */
-			    struct changed_htlc *last_sent_commit STEALS,
-			    u32 first_blocknum,
-			    u32 min_possible_feerate,
-			    u32 max_possible_feerate,
-			    const struct basepoints *local_basepoints,
-			    const struct pubkey *local_funding_pubkey,
-			    const struct pubkey *future_per_commitment_point,
-			    u32 feerate_base,
-			    u32 feerate_ppm,
-			    /* NULL or stolen */
-			    const u8 *remote_upfront_shutdown_script STEALS,
-			    u64 local_static_remotekey_start,
-			    u64 remote_static_remotekey_start,
-			    const struct channel_type *type STEALS,
-			    enum side closer,
-			    enum state_change reason,
-			    /* NULL or stolen */
-			    const struct bitcoin_outpoint *shutdown_wrong_funding STEALS,
-			    const struct height_states *height_states TAKES,
-			    u32 lease_expiry,
-			    secp256k1_ecdsa_signature *lease_commit_sig STEALS,
-			    u32 lease_chan_max_msat,
-			    u16 lease_chan_max_ppt,
-			    struct amount_msat htlc_minimum_msat,
-			    struct amount_msat htlc_maximum_msat,
-			    bool ignore_fee_limits,
-			    /* NULL or stolen */
-			    struct peer_update *peer_update STEALS);
+struct channel *new_channel(
+    struct peer *peer, u64 dbid,
+    /* NULL or stolen */
+    struct wallet_shachain *their_shachain STEALS, enum channel_state state,
+    enum side opener,
+    /* NULL or stolen */
+    struct logger *log STEALS, const char *transient_billboard TAKES,
+    u8 channel_flags, bool req_confirmed_ins_local,
+    bool req_confirmed_ins_remote, const struct channel_config *our_config,
+    u32 minimum_depth, u64 next_index_local, u64 next_index_remote,
+    u64 next_htlc_id, const struct bitcoin_outpoint *funding,
+    struct amount_sat funding_sats, struct amount_msat push,
+    struct amount_sat our_funds, bool remote_channel_ready,
+    /* NULL or stolen */
+    struct short_channel_id *scid STEALS,
+    struct short_channel_id *alias_local STEALS,
+    struct short_channel_id *alias_remote STEALS, struct channel_id *cid,
+    struct amount_msat our_msatoshi, struct amount_msat msatoshi_to_us_min,
+    struct amount_msat msatoshi_to_us_max, struct bitcoin_tx *last_tx STEALS,
+    const struct bitcoin_signature *last_sig,
+    /* NULL or stolen */
+    const struct bitcoin_signature *last_htlc_sigs STEALS,
+    const struct channel_info *channel_info,
+    const struct fee_states *fee_states TAKES,
+    /* NULL or stolen */
+    u8 *remote_shutdown_scriptpubkey STEALS,
+    const u8 *local_shutdown_scriptpubkey, u64 final_key_idx,
+    bool last_was_revoke,
+    /* NULL or stolen */
+    struct changed_htlc *last_sent_commit STEALS, u32 first_blocknum,
+    u32 min_possible_feerate, u32 max_possible_feerate,
+    const struct basepoints *local_basepoints,
+    const struct pubkey *local_funding_pubkey,
+    const struct pubkey *future_per_commitment_point, u32 feerate_base,
+    u32 feerate_ppm,
+    /* NULL or stolen */
+    const u8 *remote_upfront_shutdown_script STEALS,
+    u64 local_static_remotekey_start, u64 remote_static_remotekey_start,
+    const struct channel_type *type STEALS, enum side closer,
+    enum state_change reason,
+    /* NULL or stolen */
+    const struct bitcoin_outpoint *shutdown_wrong_funding STEALS,
+    const struct height_states *height_states TAKES, u32 lease_expiry,
+    secp256k1_ecdsa_signature *lease_commit_sig STEALS, u32 lease_chan_max_msat,
+    u16 lease_chan_max_ppt, struct amount_msat htlc_minimum_msat,
+    struct amount_msat htlc_maximum_msat, bool ignore_fee_limits,
+    /* NULL or stolen */
+    struct peer_update *peer_update STEALS,
+    struct eltoo_sign *last_complete_state,
+    struct bitcoin_tx *complete_update_tx,
+    struct bitcoin_tx *complete_settle_tx,
+    struct eltoo_sign *last_committed_state,
+    struct bitcoin_tx *committed_update_tx,
+    struct bitcoin_tx *committed_settle_tx, struct nonce *their_next_nonce,
+    struct nonce *our_next_nonce);
 
 /* new_inflight - Create a new channel_inflight for a channel */
-struct channel_inflight *new_inflight(struct channel *channel,
-	     const struct bitcoin_outpoint *funding_outpoint,
-	     u32 funding_feerate,
-	     struct amount_sat funding_sat,
-	     struct amount_sat our_funds,
-	     struct wally_psbt *funding_psbt STEALS,
-	     const u32 lease_expiry,
-	     const secp256k1_ecdsa_signature *lease_commit_sig,
-	     const u32 lease_chan_max_msat,
-	     const u16 lease_chan_max_ppt,
-	     const u32 lease_blockheight_start,
-	     const struct amount_msat lease_fee,
-	     const struct amount_sat lease_amt,
-	     s64 splice_amnt,
-	     bool i_am_initiator,
-	     bool force_sign_first);
+struct channel_inflight *new_inflight(
+    struct channel *channel, const struct bitcoin_outpoint *funding_outpoint,
+    u32 funding_feerate, struct amount_sat funding_sat,
+    struct amount_sat our_funds, struct wally_psbt *funding_psbt STEALS,
+    const u32 lease_expiry, const secp256k1_ecdsa_signature *lease_commit_sig,
+    const u32 lease_chan_max_msat, const u16 lease_chan_max_ppt,
+    const u32 lease_blockheight_start, const struct amount_msat lease_fee,
+    const struct amount_sat lease_amt, s64 splice_amnt, bool i_am_initiator,
+    bool force_sign_first);
 
 /* Add a last_tx and sig to an inflight */
 void inflight_set_last_tx(struct channel_inflight *inflight,
-		          struct bitcoin_tx *last_tx STEALS,
-		          const struct bitcoin_signature last_sig);
+			  struct bitcoin_tx *last_tx STEALS,
+			  const struct bitcoin_signature last_sig);
 
 /* If the last inflight has no commitment tx, remove it */
 bool maybe_cleanup_last_inflight(struct channel *channel);
@@ -601,21 +592,21 @@ static inline bool channel_state_closed(enum channel_state state)
 static inline bool channel_state_uncommitted(enum channel_state state)
 {
 	switch (state) {
- 	case DUALOPEND_OPEN_INIT:
+	case DUALOPEND_OPEN_INIT:
 		return true;
 	case DUALOPEND_OPEN_COMMIT_READY:
 	case DUALOPEND_OPEN_COMMITTED:
 	case CHANNELD_AWAITING_LOCKIN:
- 	case DUALOPEND_AWAITING_LOCKIN:
- 	case CHANNELD_NORMAL:
- 	case CHANNELD_AWAITING_SPLICE:
- 	case CLOSINGD_SIGEXCHANGE:
- 	case CHANNELD_SHUTTING_DOWN:
- 	case CLOSINGD_COMPLETE:
- 	case AWAITING_UNILATERAL:
- 	case FUNDING_SPEND_SEEN:
- 	case ONCHAIN:
- 	case CLOSED:
+	case DUALOPEND_AWAITING_LOCKIN:
+	case CHANNELD_NORMAL:
+	case CHANNELD_AWAITING_SPLICE:
+	case CLOSINGD_SIGEXCHANGE:
+	case CHANNELD_SHUTTING_DOWN:
+	case CLOSINGD_COMPLETE:
+	case AWAITING_UNILATERAL:
+	case FUNDING_SPEND_SEEN:
+	case ONCHAIN:
+	case CLOSED:
 		return false;
 	}
 	abort();
@@ -693,19 +684,15 @@ static inline bool channel_state_open_uncommitted(enum channel_state state)
 	abort();
 }
 
-
 void channel_set_owner(struct channel *channel, struct subd *owner);
 
 /* Channel has failed, but can try again.  Usually, set disconnect to true. */
-void channel_fail_transient(struct channel *channel,
-			    bool disconnect,
+void channel_fail_transient(struct channel *channel, bool disconnect,
 			    const char *fmt, ...) PRINTF_FMT(3, 4);
 
 /* Channel has failed, give up on it. */
-void channel_fail_permanent(struct channel *channel,
-			    enum state_change reason,
-			    const char *fmt,
-			    ...);
+void channel_fail_permanent(struct channel *channel, enum state_change reason,
+			    const char *fmt, ...);
 /* Forget the channel. This is only used for the case when we "receive" error
  * during CHANNELD_AWAITING_LOCKIN if we are "fundee". */
 void channel_fail_forget(struct channel *channel, const char *fmt, ...);
@@ -715,19 +702,18 @@ void channel_internal_error(struct channel *channel, const char *fmt, ...);
 /* Clean up any in-progress commands for a channel */
 void channel_cleanup_commands(struct channel *channel, const char *why);
 
-void channel_set_state(struct channel *channel,
-		       enum channel_state old_state,
-		       enum channel_state state,
-		       enum state_change reason,
+void channel_set_state(struct channel *channel, enum channel_state old_state,
+		       enum channel_state state, enum state_change reason,
 		       char *why);
 
 const char *channel_change_state_reason_str(enum state_change reason);
 
 /* Find a channel which is passes filter, if any: sets *others if there
  * is more than one. */
-struct channel *peer_any_channel(struct peer *peer,
-				 bool (*channel_state_filter)(enum channel_state),
-				 bool *others);
+struct channel *
+peer_any_channel(struct peer *peer,
+		 bool (*channel_state_filter)(enum channel_state),
+		 bool *others);
 
 struct channel *channel_by_dbid(struct lightningd *ld, const u64 dbid);
 
@@ -758,8 +744,15 @@ struct channel *find_channel_by_alias(const struct peer *peer,
  * might need to CPFP the fee if it force closes!) */
 bool have_anchor_channel(struct lightningd *ld);
 
-void channel_set_last_tx(struct channel *channel,
-			 struct bitcoin_tx *tx,
+void channel_set_last_eltoo_txs(struct channel *channel,
+				struct bitcoin_tx *update_tx,
+				struct bitcoin_tx *settle_tx,
+				struct partial_sig *their_psig,
+				struct partial_sig *our_psig,
+				struct musig_session *session,
+				enum wallet_tx_type type);
+
+void channel_set_last_tx(struct channel *channel, struct bitcoin_tx *tx,
 			 const struct bitcoin_signature *sig);
 
 static inline bool channel_has(const struct channel *channel, int f)
@@ -774,11 +767,11 @@ static inline bool channel_has(const struct channel *channel, int f)
  * don't have a scid yet, e.g., for `zeroconf` channels, so we resort
  * to referencing it by the local alias, which we have in that case.
  */
-const struct short_channel_id *channel_scid_or_local_alias(const struct channel *chan);
+const struct short_channel_id *
+channel_scid_or_local_alias(const struct channel *chan);
 
 void get_channel_basepoints(struct lightningd *ld,
-			    const struct node_id *peer_id,
-			    const u64 dbid,
+			    const struct node_id *peer_id, const u64 dbid,
 			    struct basepoints *local_basepoints,
 			    struct pubkey *local_funding_pubkey);
 

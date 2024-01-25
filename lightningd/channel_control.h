@@ -10,33 +10,37 @@ struct lightningd;
 struct peer_fd;
 struct peer;
 
-bool peer_start_channeld(struct channel *channel,
-			 struct peer_fd *peer_fd,
-			 const u8 *fwd_msg,
-			 bool reconnected,
+void peer_start_eltoo_channeld(struct channel *channel, struct peer_fd *peer_fd,
+			       const u8 *fwd_msg, bool reconnected,
+			       bool reestablish_only);
+
+bool peer_start_channeld(struct channel *channel, struct peer_fd *peer_fd,
+			 const u8 *fwd_msg, bool reconnected,
 			 bool reestablish_only);
 
 /* Send message to channeld (if connected) to tell it about depth
  * c.f. dualopen_tell_depth! */
 void channeld_tell_depth(struct channel *channel,
-			 const struct bitcoin_txid *txid,
-			 u32 depth);
+			 const struct bitcoin_txid *txid, u32 depth);
 
 /* Notify channels of new blocks. */
-void channel_notify_new_block(struct lightningd *ld,
-			      u32 block_height);
+void channel_notify_new_block(struct lightningd *ld, u32 block_height);
 
 /* Cancel the channel after `fundchannel_complete` succeeds
  * but before funding broadcasts. */
 struct command_result *cancel_channel_before_broadcast(struct command *cmd,
 						       struct peer *peer);
 
+/* Update the channel info on funding locked eltoo*/
+bool channel_on_funding_locked_eltoo(struct channel *channel);
+
 /* Update the channel info on channel_ready */
 bool channel_on_channel_ready(struct channel *channel,
 			      struct pubkey *next_per_commitment_point);
 
 /* Record channel open (coin movement notifications) */
-void channel_record_open(struct channel *channel, u32 blockheight, bool record_push);
+void channel_record_open(struct channel *channel, u32 blockheight,
+			 bool record_push);
 
 /* A channel has unrecoverably fallen behind */
 void channel_fallen_behind(struct channel *channel, const u8 *msg);
@@ -45,7 +49,8 @@ void channel_fallen_behind(struct channel *channel, const u8 *msg);
 void channel_replace_update(struct channel *channel, u8 *update TAKES);
 
 /* Tell channel about new feerates (owner must be channeld!) */
-void channel_update_feerates(struct lightningd *ld, const struct channel *channel);
+void channel_update_feerates(struct lightningd *ld,
+			     const struct channel *channel);
 
 /* This channel is now locked in (the normal way, not zeroconf) */
 void lockin_complete(struct channel *channel,

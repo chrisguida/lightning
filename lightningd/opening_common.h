@@ -64,10 +64,13 @@ struct uncommitted_channel {
 	 * amount. Otherwise it will be used by openingd as absolute
 	 * value (clamped to dust limit). */
 	struct amount_sat *reserve;
+
+	bool is_eltoo;
 };
 
 struct funding_channel {
-	struct command *cmd; /* Which initially owns us until openingd request */
+	struct command
+	    *cmd; /* Which initially owns us until openingd request */
 
 	struct wallet_tx *wtx;
 	struct amount_msat push;
@@ -108,10 +111,8 @@ struct funding_channel {
 struct uncommitted_channel *new_uncommitted_channel(struct peer *peer);
 
 void opend_channel_errmsg(struct uncommitted_channel *uc,
-			  struct peer_fd *peer_fd,
-			  const char *desc,
-			  const u8 *err_for_them UNUSED,
-			  bool disconnect UNUSED,
+			  struct peer_fd *peer_fd, const char *desc,
+			  const u8 *err_for_them UNUSED, bool disconnect UNUSED,
 			  bool warning UNUSED);
 
 void opend_channel_set_billboard(struct uncommitted_channel *uc,
@@ -119,15 +120,16 @@ void opend_channel_set_billboard(struct uncommitted_channel *uc,
 				 const char *happenings TAKES);
 
 void uncommitted_channel_disconnect(struct uncommitted_channel *uc,
-				    enum log_level level,
-				    const char *desc);
+				    enum log_level level, const char *desc);
 
-void kill_uncommitted_channel(struct uncommitted_channel *uc,
-			      const char *why);
+void kill_uncommitted_channel(struct uncommitted_channel *uc, const char *why);
 
-void channel_config(struct lightningd *ld,
-		    struct channel_config *ours,
+void channel_config(struct lightningd *ld, struct channel_config *ours,
 		    u32 *max_to_self_delay,
 		    struct amount_msat *min_effective_htlc_capacity);
+
+void eltoo_channel_config(struct lightningd *ld, struct channel_config *ours,
+			  u32 *max_shared_delay,
+			  struct amount_msat *min_effective_htlc_capacity);
 
 #endif /* LIGHTNING_LIGHTNINGD_OPENING_COMMON_H */
