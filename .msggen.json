@@ -559,7 +559,7 @@
             "Decode.valid": 2,
             "Decode.version": 71,
             "Decode.warning_invalid_invoice_request_signature": 39,
-            "Decode.warning_invalid_invoice_signature": 58,
+            "Decode.warning_invalid_invoice_signature": 77,
             "Decode.warning_invalid_invreq_payer_note": 37,
             "Decode.warning_invalid_offer_currency": 23,
             "Decode.warning_invalid_offer_description": 21,
@@ -1140,7 +1140,10 @@
             "ListPeerChannels.channels[].in_payments_offered": 44,
             "ListPeerChannels.channels[].inflight[]": 16,
             "ListPeerChannels.channels[].initial_feerate": 12,
+            "ListPeerChannels.channels[].last_committed_settle_tx": 60,
             "ListPeerChannels.channels[].last_feerate": 13,
+            "ListPeerChannels.channels[].last_settle_tx": 57,
+            "ListPeerChannels.channels[].last_update_tx": 56,
             "ListPeerChannels.channels[].max_accepted_htlcs": 40,
             "ListPeerChannels.channels[].max_to_us_msat": 25,
             "ListPeerChannels.channels[].max_total_htlc_in_msat": 30,
@@ -1172,6 +1175,8 @@
             "ListPeerChannels.channels[].their_to_self_delay": 38,
             "ListPeerChannels.channels[].to_us_msat": 23,
             "ListPeerChannels.channels[].total_msat": 26,
+            "ListPeerChannels.channels[].unbound_settle_tx": 59,
+            "ListPeerChannels.channels[].unbound_update_tx": 61,
             "ListPeerChannels.channels[].updates": 55
         },
         "ListpeerchannelsChannelsAlias": {
@@ -1274,10 +1279,7 @@
             "ListPeers.peers[].channels[].in_payments_offered": 38,
             "ListPeers.peers[].channels[].inflight[]": 13,
             "ListPeers.peers[].channels[].initial_feerate": 9,
-            "ListPeers.peers[].channels[].last_committed_settle_tx": 54,
             "ListPeers.peers[].channels[].last_feerate": 10,
-            "ListPeers.peers[].channels[].last_settle_tx": 51,
-            "ListPeers.peers[].channels[].last_update_tx": 50,
             "ListPeers.peers[].channels[].max_accepted_htlcs": 35,
             "ListPeers.peers[].channels[].max_to_us_msat": 22,
             "ListPeers.peers[].channels[].max_total_htlc_in_msat": 27,
@@ -1306,9 +1308,7 @@
             "ListPeers.peers[].channels[].their_reserve_msat": 28,
             "ListPeers.peers[].channels[].their_to_self_delay": 33,
             "ListPeers.peers[].channels[].to_us_msat": 20,
-            "ListPeers.peers[].channels[].total_msat": 23,
-            "ListPeers.peers[].channels[].unbound_settle_tx": 53,
-            "ListPeers.peers[].channels[].unbound_update_tx": 52
+            "ListPeers.peers[].channels[].total_msat": 23
         },
         "ListpeersPeersChannelsAlias": {
             "ListPeers.peers[].channels[].alias.local": 1,
@@ -4387,8 +4387,20 @@
             "added": "v23.02",
             "deprecated": false
         },
+        "ListPeerChannels.channels[].last_committed_settle_tx": {
+            "added": "v24.02",
+            "deprecated": false
+        },
         "ListPeerChannels.channels[].last_feerate": {
             "added": "v23.02",
+            "deprecated": false
+        },
+        "ListPeerChannels.channels[].last_settle_tx": {
+            "added": "v24.02",
+            "deprecated": false
+        },
+        "ListPeerChannels.channels[].last_update_tx": {
+            "added": "v24.02",
             "deprecated": false
         },
         "ListPeerChannels.channels[].max_accepted_htlcs": {
@@ -4533,6 +4545,14 @@
         },
         "ListPeerChannels.channels[].total_msat": {
             "added": "v23.02",
+            "deprecated": false
+        },
+        "ListPeerChannels.channels[].unbound_settle_tx": {
+            "added": "v24.02",
+            "deprecated": false
+        },
+        "ListPeerChannels.channels[].unbound_update_tx": {
+            "added": "v24.02",
             "deprecated": false
         },
         "ListPeerChannels.channels[].updates": {

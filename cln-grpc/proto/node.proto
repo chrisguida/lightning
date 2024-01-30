@@ -236,11 +236,6 @@ message ListpeersPeersChannels {
 	optional uint64 out_payments_fulfilled = 44;
 	optional Amount out_fulfilled_msat = 45;
 	repeated ListpeersPeersChannelsHtlcs htlcs = 46;
-	optional string last_update_tx = 50;
-	optional string last_settle_tx = 51;
-	optional string unbound_update_tx = 52;
-	optional string unbound_settle_tx = 53;
-	optional string last_committed_settle_tx = 54;
 	optional string close_to_addr = 47;
 }
 
@@ -1242,6 +1237,11 @@ message ListpeerchannelsChannels {
 	optional uint64 out_payments_fulfilled = 50;
 	optional Amount out_fulfilled_msat = 51;
 	repeated ListpeerchannelsChannelsHtlcs htlcs = 52;
+	optional string last_update_tx = 56;
+	optional string last_settle_tx = 57;
+	optional string unbound_update_tx = 61;
+	optional string unbound_settle_tx = 59;
+	optional string last_committed_settle_tx = 60;
 	optional string close_to_addr = 53;
 }
 
@@ -1466,7 +1466,7 @@ message DecodeResponse {
 	optional string warning_missing_invoice_recurrence_basetime = 55;
 	optional string warning_missing_invoice_node_id = 56;
 	optional string warning_missing_invoice_signature = 57;
-	optional string warning_invalid_invoice_signature = 58;
+	optional string warning_invalid_invoice_signature = 77;
 	repeated DecodeFallbacks fallbacks = 59;
 	optional uint64 created_at = 60;
 	optional uint64 expiry = 61;

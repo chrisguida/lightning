@@ -920,6 +920,11 @@ def listpeerchannels_channels2py(m):
         "out_payments_fulfilled": m.out_payments_fulfilled,  # PrimitiveField in generate_composite
         "out_fulfilled_msat": amount2msat(m.out_fulfilled_msat),  # PrimitiveField in generate_composite
         "htlcs": [listpeerchannels_channels_htlcs2py(i) for i in m.htlcs],  # ArrayField[composite] in generate_composite
+        "last_update_tx": m.last_update_tx,  # PrimitiveField in generate_composite
+        "last_settle_tx": m.last_settle_tx,  # PrimitiveField in generate_composite
+        "unbound_update_tx": m.unbound_update_tx,  # PrimitiveField in generate_composite
+        "unbound_settle_tx": m.unbound_settle_tx,  # PrimitiveField in generate_composite
+        "last_committed_settle_tx": m.last_committed_settle_tx,  # PrimitiveField in generate_composite
         "close_to_addr": m.close_to_addr,  # PrimitiveField in generate_composite
     })
 

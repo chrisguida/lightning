@@ -132,6 +132,11 @@ On success, an object containing **channels** is returned.  It is an array of ob
   If **direction** is "in":
 
     - **state** (string): Status of the HTLC (one of "RCVD\_ADD\_HTLC", "RCVD\_ADD\_COMMIT", "SENT\_ADD\_REVOCATION", "SENT\_ADD\_ACK\_COMMIT", "RCVD\_ADD\_ACK\_REVOCATION", "SENT\_REMOVE\_HTLC", "SENT\_REMOVE\_COMMIT", "RCVD\_REMOVE\_REVOCATION", "RCVD\_REMOVE\_ACK\_COMMIT", "SENT\_REMOVE\_ACK\_REVOCATION")
+- **last\_update\_tx** (string, optional): latest signed and finalized update transaction bound to latest state output
+- **last\_settle\_tx** (string, optional): latest signed and finalized settle transaction bound to last\_update\_tx state outpoint
+- **unbound\_update\_tx** (string, optional): latest unfinalized update transaction
+- **unbound\_settle\_tx** (string, optional): latest unfinalized settle transaction
+- **last\_committed\_settle\_tx** (string, optional): latest finalized settle transaction bound to a committed-but-not-complete update transaction
 
 If **close\_to** is present:
 
@@ -215,4 +220,4 @@ Main web site: <https://github.com/ElementsProject/lightning> Lightning
 RFC site (BOLT \#9):
 <https://github.com/lightningnetwork/lightning-rfc/blob/master/09-features.md>
 
-[comment]: # ( SHA256STAMP:fac5201293041a7875d78c0f7acc0067ba34d5ad4b809307ea334afde7563aaf)
+[comment]: # ( SHA256STAMP:31d9322d961f1ce7581790d955896b556658a5aa2d0f868fef064fc707f70989)
