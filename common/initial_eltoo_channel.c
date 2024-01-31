@@ -100,9 +100,9 @@ struct bitcoin_tx *initial_settle_channel_tx(const tal_t *ctx,
 
 	if (init_settle_tx) {
 		psbt_input_add_pubkey(init_settle_tx->psbt, 0,
-				      &channel->eltoo_keyset.self_funding_key);
+				      &channel->eltoo_keyset.self_funding_key, true);
 		psbt_input_add_pubkey(init_settle_tx->psbt, 0,
-				      &channel->eltoo_keyset.other_funding_key);
+				      &channel->eltoo_keyset.other_funding_key, true);
 	}
 
 	return init_settle_tx;
@@ -129,9 +129,9 @@ struct bitcoin_tx *initial_update_channel_tx(const tal_t *ctx,
 
 	if (init_update_tx) {
 		psbt_input_add_pubkey(init_update_tx->psbt, 0,
-				      &channel->eltoo_keyset.self_funding_key);
+				      &channel->eltoo_keyset.self_funding_key, true);
 		psbt_input_add_pubkey(init_update_tx->psbt, 0,
-				      &channel->eltoo_keyset.other_funding_key);
+				      &channel->eltoo_keyset.other_funding_key, true);
 	}
 
 	return init_update_tx;

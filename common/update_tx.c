@@ -48,7 +48,7 @@ u8 *make_annex_from_script(const tal_t *ctx, const u8 *script)
     preimage_cursor += tapscript_len;
 
     assert(tal_count(tapleaf_preimage) == preimage_cursor - tapleaf_preimage);
-    ok = wally_tagged_hash(tapleaf_preimage, tal_count(tapleaf_preimage), "TapLeaf", result.u.u8);
+    ok = wally_bip340_tagged_hash(tapleaf_preimage, tal_count(tapleaf_preimage), "TapLeaf", result.u.u8, sizeof(result.u.u8));
     assert(ok == WALLY_OK);
 
     annex[0] = 0x50; /* annex flag */

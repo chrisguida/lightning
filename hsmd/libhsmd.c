@@ -59,36 +59,6 @@ static inline bool musig_state_eq(const struct musig_state *state,
 HTABLE_DEFINE_TYPE(struct musig_state, keyof_musig_state, channel_id_key,
 		   musig_state_eq, musig_state_map);
 
-struct musig_state {
-	struct channel_id channel_id;
-	secp256k1_musig_secnonce sec_nonce;
-};
-
-size_t channel_id_key(const struct channel_id *id)
-{
-	struct siphash24_ctx ctx;
-	siphash24_init(&ctx, siphash_seed());
-	/* channel doesn't move while in this hash, so we just hash pointer. */
-	siphash24_update(&ctx, id->id, sizeof(id->id));
-
-	return siphash24_done(&ctx);
-}
-
-static inline const struct channel_id *
-keyof_musig_state(const struct musig_state *state)
-{
-	return &state->channel_id;
-}
-
-static inline bool musig_state_eq(const struct musig_state *state,
-				  const struct channel_id *id)
-{
-	return channel_id_eq(&state->channel_id, id);
-}
-
-HTABLE_DEFINE_TYPE(struct musig_state, keyof_musig_state, channel_id_key,
-		   musig_state_eq, musig_state_map);
-
 /*~ Nobody will ever find it here!  hsm_secret is our root secret, the bip32
  * tree, bolt12 payer_id keys and derived_secret are derived from that, and
  * cached here. */
@@ -512,43 +482,6 @@ static u8 *handle_lock_outpoint(struct hsmd_client *c, const u8 *msg_in)
 	/* Stub implementation */
 
 	return towire_hsmd_lock_outpoint_reply(NULL);
-}
-
-/* ~This stub implementation is overriden by fully validating signers
- * that need the unchanging channel parameters. */
-static u8 *handle_ready_eltoo_channel(struct hsmd_client *c, const u8 *msg_in)
-{
-	bool is_outbound;
-	struct amount_sat channel_value;
-	struct amount_msat push_value;
-	struct bitcoin_txid funding_txid;
-	u16 funding_txout;
-	u16 shared_delay;
-	u8 *local_shutdown_script;
-	u32 *local_shutdown_wallet_index;
-	struct pubkey remote_funding_pubkey, remote_settle_pubkey;
-	u8 *remote_shutdown_script;
-	struct amount_msat value_msat;
-	struct channel_type *channel_type;
-
-	if (!fromwire_hsmd_ready_eltoo_channel(
-		tmpctx, msg_in, &is_outbound, &channel_value, &push_value,
-		&funding_txid, &funding_txout, &shared_delay,
-		&local_shutdown_script, &local_shutdown_wallet_index,
-		&remote_funding_pubkey, &remote_settle_pubkey,
-		&remote_shutdown_script, &channel_type))
-		return hsmd_status_malformed_request(c, msg_in);
-
-	/* Stub implementation */
-
-	/* Fail fast if any values are uninitialized or obviously wrong. */
-	assert(amount_sat_greater(channel_value, AMOUNT_SAT(0)));
-	assert(amount_sat_to_msat(&value_msat, channel_value));
-	assert(amount_msat_less_eq(push_value, value_msat));
-	assert(!mem_is_zero(&funding_txid, sizeof(funding_txid)));
-	assert(shared_delay > 0);
-
-	return towire_hsmd_ready_eltoo_channel_reply(NULL);
 }
 
 /* ~This stub implementation is overriden by fully validating signers

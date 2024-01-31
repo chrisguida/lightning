@@ -89,21 +89,6 @@ static inline struct htlc *eltoo_htlc_get(struct htlc_map *htlcs, u64 id,
 	return NULL;
 }
 
-static inline struct htlc *eltoo_htlc_get(struct htlc_map *htlcs, u64 id,
-					  enum side owner)
-{
-	struct htlc *h;
-	struct htlc_map_iter it;
-
-	for (h = htlc_map_getfirst(htlcs, id, &it); h;
-	     h = htlc_map_getnext(htlcs, id, &it)) {
-		if (h->id == id &&
-		    eltoo_htlc_has(h, HTLC_FLAG(owner, HTLC_F_OWNER)))
-			return h;
-	}
-	return NULL;
-}
-
 /* FIXME: Move these out of the hash! */
 static inline bool htlc_is_dead(const struct htlc *htlc)
 {

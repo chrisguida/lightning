@@ -654,6 +654,8 @@ static void handle_recv_gossip(struct daemon *daemon, const u8 *outermsg)
 	case WIRE_ACCEPT_CHANNEL2:
 	case WIRE_ONION_MESSAGE:
 	/* Eltoo stuff */
+    case WIRE_UPDATE_NOOP:
+    case WIRE_YIELD:
 	case WIRE_OPEN_CHANNEL_ELTOO:
 	case WIRE_ACCEPT_CHANNEL_ELTOO:
 	case WIRE_FUNDING_CREATED_ELTOO:
