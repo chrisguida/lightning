@@ -82,6 +82,9 @@ static bool option_anchor_outputs;
 /* Does option_anchors_zero_fee_htlc_tx apply to this commitment tx? */
 static bool option_anchors_zero_fee_htlc_tx;
 
+/* Does option_commit_zero_fees apply to this commitment tx? */
+static bool option_commit_zero_fees;
+
 /* The minimum relay feerate acceptable to the fullnode.  */
 static u32 min_relay_feerate;
 
@@ -520,7 +523,8 @@ static struct amount_sat get_htlc_success_fee(struct tracked_output *out)
 	tx = htlc_success_tx(tmpctx, chainparams, &out->outpoint, out->wscript,
 			     htlc_amount, to_self_delay[LOCAL], 0, keyset,
 			     option_anchor_outputs,
-			     option_anchors_zero_fee_htlc_tx);
+			     option_anchors_zero_fee_htlc_tx,
+			     option_commit_zero_fees);
 
 	/* BOLT #3:
 	 *
@@ -1561,6 +1565,7 @@ static void output_spent(struct tracked_output ***outs,
 		case ELEMENTS_FEE:
 		case ANCHOR_TO_US:
 		case ANCHOR_TO_THEM:
+		case EPHEMERAL_ANCHOR:
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
 				      "Tracked spend of %s/%s?",
 				      tx_type_name(out->tx_type),
@@ -2084,7 +2089,8 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 				     htlcs[matches[i]].cltv_expiry,
 				     to_self_delay[LOCAL], 0, keyset,
 				     option_anchor_outputs,
-				     option_anchors_zero_fee_htlc_tx);
+				     option_anchors_zero_fee_htlc_tx,
+				     option_commit_zero_fees);
 
 		if (set_htlc_timeout_fee(tx, out->remote_htlc_sig,
 					 htlc_scripts[matches[i]]))
@@ -2378,7 +2384,7 @@ handle_our_unilateral(const struct tx_parts *tx, u32 tx_blockheight,
 		      struct tracked_output **outs)
 {
 	u8 **htlc_scripts;
-	u8 *local_wscript, *script[NUM_SIDES], *anchor[NUM_SIDES];
+	u8 *local_wscript, *script[NUM_SIDES], *anchor[NUM_SIDES], *eph_anchor;
 	struct pubkey local_per_commitment_point;
 	struct keyset *ks;
 	size_t i;
@@ -2449,6 +2455,7 @@ handle_our_unilateral(const struct tx_parts *tx, u32 tx_blockheight,
 	}
 
 	get_anchor_scriptpubkeys(tmpctx, anchor);
+    eph_anchor = bitcoin_ephemeral_anchor(tmpctx);
 
 	for (i = 0; i < tal_count(tx->outputs); i++) {
 		struct tracked_output *out;
@@ -2521,6 +2528,20 @@ handle_our_unilateral(const struct tx_parts *tx, u32 tx_blockheight,
 			ignore_output(out);
 			record_external_deposit(out, tx_blockheight, ANCHOR);
 			anchor[REMOTE] = NULL;
+			continue;
+		}
+		if (eph_anchor
+		    && wally_tx_output_scripteq(tx->outputs[i],
+						eph_anchor)) {
+			out = new_tracked_output(&outs, &outpoint,
+						 tx_blockheight,
+						 OUR_UNILATERAL,
+						 amt,
+						 EPHEMERAL_ANCHOR,
+						 NULL, NULL, NULL);
+			ignore_output(out);
+			record_external_deposit(out, tx_blockheight, ANCHOR);
+			eph_anchor = NULL;
 			continue;
 		}
 
@@ -2762,7 +2783,7 @@ static void handle_their_cheat(const struct tx_parts *tx, u32 tx_blockheight,
 			       struct tracked_output **outs)
 {
 	u8 **htlc_scripts;
-	u8 *remote_wscript, *script[NUM_SIDES], *anchor[NUM_SIDES];
+	u8 *remote_wscript, *script[NUM_SIDES], *anchor[NUM_SIDES], *eph_anchor;
 	struct keyset *ks;
 	struct pubkey *k;
 	size_t i;
@@ -2858,6 +2879,7 @@ static void handle_their_cheat(const struct tx_parts *tx, u32 tx_blockheight,
 	status_debug("Script to-me: %s", tal_hex(tmpctx, script[LOCAL]));
 
 	get_anchor_scriptpubkeys(tmpctx, anchor);
+    eph_anchor = bitcoin_ephemeral_anchor(tmpctx);
 
 	for (i = 0; i < tal_count(tx->outputs); i++) {
 		if (tx->outputs[i]->script_len == 0)
@@ -2938,6 +2960,20 @@ static void handle_their_cheat(const struct tx_parts *tx, u32 tx_blockheight,
 			ignore_output(out);
 			record_external_deposit(out, tx_blockheight, ANCHOR);
 			anchor[REMOTE] = NULL;
+			continue;
+		}
+		if (eph_anchor
+		    && wally_tx_output_scripteq(tx->outputs[i],
+						eph_anchor)) {
+			out = new_tracked_output(&outs, &outpoint,
+						 tx_blockheight,
+						 THEIR_REVOKED_UNILATERAL,
+						 amt,
+						 EPHEMERAL_ANCHOR,
+						 NULL, NULL, NULL);
+			ignore_output(out);
+			record_external_deposit(out, tx_blockheight, ANCHOR);
+			eph_anchor = NULL;
 			continue;
 		}
 
@@ -3060,7 +3096,7 @@ handle_their_unilateral(const struct tx_parts *tx, u32 tx_blockheight,
 			const enum side opener, struct tracked_output **outs)
 {
 	u8 **htlc_scripts;
-	u8 *remote_wscript, *script[NUM_SIDES], *anchor[NUM_SIDES];
+	u8 *remote_wscript, *script[NUM_SIDES], *anchor[NUM_SIDES], *eph_anchor;
 	struct keyset *ks;
 	size_t i;
 	struct htlcs_info *htlcs_info;
@@ -3133,6 +3169,7 @@ handle_their_unilateral(const struct tx_parts *tx, u32 tx_blockheight,
 	htlc_scripts = derive_htlc_scripts(htlcs_info->htlcs, REMOTE);
 
 	get_anchor_scriptpubkeys(tmpctx, anchor);
+    eph_anchor = bitcoin_ephemeral_anchor(tmpctx);
 
 	for (i = 0; i < tal_count(tx->outputs); i++) {
 		if (tx->outputs[i]->script_len == 0)
@@ -3225,6 +3262,20 @@ handle_their_unilateral(const struct tx_parts *tx, u32 tx_blockheight,
 			ignore_output(out);
 			anchor[REMOTE] = NULL;
 			record_external_deposit(out, tx_blockheight, ANCHOR);
+			continue;
+		}
+		if (eph_anchor
+		    && wally_tx_output_scripteq(tx->outputs[i],
+						eph_anchor)) {
+			out = new_tracked_output(&outs, &outpoint,
+						 tx_blockheight,
+						 THEIR_UNILATERAL,
+						 amt,
+						 EPHEMERAL_ANCHOR,
+						 NULL, NULL, NULL);
+			ignore_output(out);
+			record_external_deposit(out, tx_blockheight, ANCHOR);
+			eph_anchor = NULL;
 			continue;
 		}
 
@@ -3504,6 +3555,9 @@ int main(int argc, char *argv[])
 		&min_relay_feerate)) {
 		master_badmsg(WIRE_ONCHAIND_INIT, msg);
 	}
+
+    // FIXME thread this through
+    option_commit_zero_fees = false;
 
 	/* We need to keep tx around, but there's only one: not really a leak */
 	tal_steal(ctx, notleak(tx));

@@ -273,7 +273,8 @@ struct bitcoin_tx *htlc_success_tx(
     struct amount_msat htlc_msatoshi UNNEEDED, u16 to_self_delay UNNEEDED,
     u32 feerate_per_kw UNNEEDED, const struct keyset *keyset UNNEEDED,
     bool option_anchor_outputs UNNEEDED,
-    bool option_anchors_zero_fee_htlc_tx UNNEEDED)
+    bool option_anchors_zero_fee_htlc_tx UNNEEDED,
+    bool option_commit_zero_fees UNNEEDED)
 {
 	fprintf(stderr, "htlc_success_tx called!\n");
 	abort();
@@ -576,7 +577,7 @@ struct bitcoin_tx *htlc_timeout_tx(
     struct amount_msat htlc_msatoshi, u32 cltv_expiry,
     u16 to_self_delay UNNEEDED, u32 feerate_per_kw UNNEEDED,
     const struct keyset *keyset UNNEEDED, bool option_anchor_outputs,
-    bool option_anchors_zero_fee_htlc_tx)
+    bool option_anchors_zero_fee_htlc_tx, bool option_commit_zero_fees)
 {
 	struct bitcoin_tx *tx;
 	struct amount_sat in_amount;

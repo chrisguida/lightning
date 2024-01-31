@@ -736,7 +736,7 @@ onchaind_tx_unsigned(const tal_t *ctx, struct channel *channel,
 		return NULL;
 	}
 
-	tx = bitcoin_tx(ctx, chainparams, 1, 1, info->locktime);
+	tx = bitcoin_tx(ctx, chainparams, 1, 1, info->locktime, 2);
 	bitcoin_tx_add_input(tx, &info->out, info->to_self_delay, NULL,
 			     info->out_sats, NULL, info->wscript);
 
@@ -1246,6 +1246,8 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 	    channel_has(channel, OPT_ANCHOR_OUTPUTS);
 	const bool option_anchors_zero_fee_htlc_tx =
 	    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
+	const bool option_commit_zero_fees =
+	    channel_has(channel, OPT_COMMIT_ZERO_FEES);
 
 	info = new_signing_info(msg, channel, WIRE_ONCHAIND_SPEND_HTLC_SUCCESS);
 	info->minblock = 0;
@@ -1267,7 +1269,7 @@ static void handle_onchaind_spend_htlc_success(struct channel *channel,
 	 */
 	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats,
 		     htlc_wscript, fee, 0, option_anchor_outputs,
-		     option_anchors_zero_fee_htlc_tx);
+		     option_anchors_zero_fee_htlc_tx, option_commit_zero_fees);
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */
@@ -1327,6 +1329,8 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	    channel_has(channel, OPT_ANCHOR_OUTPUTS);
 	const bool option_anchors_zero_fee_htlc_tx =
 	    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
+	const bool option_commit_zero_fees =
+	    channel_has(channel, OPT_COMMIT_ZERO_FEES);
 
 	info = new_signing_info(msg, channel, WIRE_ONCHAIND_SPEND_HTLC_TIMEOUT);
 
@@ -1346,7 +1350,7 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	 */
 	tx = htlc_tx(NULL, chainparams, &out, info->wscript, out_sats,
 		     htlc_wscript, fee, cltv_expiry, option_anchor_outputs,
-		     option_anchors_zero_fee_htlc_tx);
+		     option_anchors_zero_fee_htlc_tx, option_commit_zero_fees);
 	tal_free(htlc_wscript);
 	if (!tx) {
 		/* Can only happen if fee > out_sats */

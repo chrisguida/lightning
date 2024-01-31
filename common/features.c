@@ -80,6 +80,10 @@ static const struct feature_style feature_styles[] = {
      .copy_style = {[INIT_FEATURE] = FEATURE_REPRESENT,
 		    [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 		    [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT}},
+    {OPT_COMMIT_ZERO_FEES,
+     .copy_style = {[INIT_FEATURE] = FEATURE_REPRESENT,
+		    [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
+		    [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT}},
     {OPT_DUAL_FUND, .copy_style = {[INIT_FEATURE] = FEATURE_REPRESENT,
 				   [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 				   [BOLT11_FEATURE] = FEATURE_REPRESENT,
@@ -183,6 +187,7 @@ static const struct dependency feature_deps[] = {
      * `option_route_blinding` | ...      | ...      | `var_onion_optin`
      */
     {OPT_ROUTE_BLINDING, OPT_VAR_ONION},
+    {OPT_COMMIT_ZERO_FEES, OPT_STATIC_REMOTEKEY},
 };
 
 static void trim_features(u8 **features)
@@ -468,8 +473,11 @@ const char *feature_name(const tal_t *ctx, size_t f)
 	    "option_scid_alias", /* https://github.com/lightning/bolts/pull/910
 				  */
 	    "option_payment_metadata",
-	    "option_zeroconf", /* 50/51,
-				  https://github.com/lightning/bolts/pull/910 */
+	    "option_zeroconf",	       /* 50/51,
+					  https://github.com/lightning/bolts/pull/910 */
+	    "option_commit_zero_fees", /* 52/53
+					  https://github.com/instagibbs/bolts/commits/zero_fee_commitment
+					*/
 	    NULL,
 	    "option_keysend",
 	    "option_trampoline_routing", /* https://github.com/lightning/bolts/pull/836

@@ -10,12 +10,13 @@ htlc_tx(const tal_t *ctx, const struct chainparams *chainparams,
 	const struct bitcoin_outpoint *commit, const u8 *commit_wscript,
 	struct amount_sat amount, const u8 *htlc_tx_wscript,
 	struct amount_sat htlc_fee, u32 locktime, bool option_anchor_outputs,
-	bool option_anchors_zero_fee_htlc_tx)
+	bool option_anchors_zero_fee_htlc_tx, bool option_commit_zero_fee)
 {
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
-	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams, 1, 1, locktime);
+	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams, 1, 1, locktime,
+					   option_commit_zero_fee ? 3 : 2);
 
 	/* BOLT #3:
 	 *
@@ -39,10 +40,13 @@ htlc_tx(const tal_t *ctx, const struct chainparams *chainparams,
 	 *      transaction
 	 *    * `txin[0]` sequence: `0` (set to `1` for `option_anchors`)
 	 */
-	bitcoin_tx_add_input(
-	    tx, commit,
-	    (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) ? 1 : 0,
-	    NULL, amount, NULL, commit_wscript, NULL, NULL);
+	bitcoin_tx_add_input(tx, commit,
+			     (option_anchor_outputs ||
+			      option_anchors_zero_fee_htlc_tx ||
+			      option_commit_zero_fee)
+				 ? 1
+				 : 0,
+			     NULL, amount, NULL, commit_wscript);
 
 	/* BOLT #3:
 	 * * txout count: 1
@@ -65,13 +69,12 @@ htlc_tx(const tal_t *ctx, const struct chainparams *chainparams,
 	return tx;
 }
 
-struct bitcoin_tx *
-htlc_success_tx(const tal_t *ctx, const struct chainparams *chainparams,
-		const struct bitcoin_outpoint *commit, const u8 *commit_wscript,
-		struct amount_msat htlc_msatoshi, u16 to_self_delay,
-		u32 feerate_per_kw, const struct keyset *keyset,
-		bool option_anchor_outputs,
-		bool option_anchors_zero_fee_htlc_tx)
+struct bitcoin_tx *htlc_success_tx(
+    const tal_t *ctx, const struct chainparams *chainparams,
+    const struct bitcoin_outpoint *commit, const u8 *commit_wscript,
+    struct amount_msat htlc_msatoshi, u16 to_self_delay, u32 feerate_per_kw,
+    const struct keyset *keyset, bool option_anchor_outputs,
+    bool option_anchors_zero_fee_htlc_tx, bool option_commit_zero_fees)
 {
 	const u8 *htlc_wscript;
 
@@ -85,8 +88,10 @@ htlc_success_tx(const tal_t *ctx, const struct chainparams *chainparams,
 	    ctx, chainparams, commit, commit_wscript,
 	    amount_msat_to_sat_round_down(htlc_msatoshi), htlc_wscript,
 	    htlc_success_fee(feerate_per_kw, option_anchor_outputs,
-			     option_anchors_zero_fee_htlc_tx),
-	    0, option_anchor_outputs, option_anchors_zero_fee_htlc_tx);
+			     option_anchors_zero_fee_htlc_tx,
+			     option_commit_zero_fees),
+	    0, option_anchor_outputs, option_anchors_zero_fee_htlc_tx,
+	    option_commit_zero_fees);
 }
 
 /* Fill in the witness for HTLC-success tx produced above. */
@@ -97,6 +102,7 @@ void htlc_success_tx_add_witness(
     const struct bitcoin_signature *remotehtlcsig,
     const struct preimage *payment_preimage, const struct pubkey *revocationkey,
     bool option_anchor_outputs, bool option_anchors_zero_fee_htlc_tx)
+
 {
 	struct sha256 hash;
 	u8 *wscript, **witness;
@@ -114,13 +120,12 @@ void htlc_success_tx_add_witness(
 	tal_free(wscript);
 }
 
-struct bitcoin_tx *
-htlc_timeout_tx(const tal_t *ctx, const struct chainparams *chainparams,
-		const struct bitcoin_outpoint *commit, const u8 *commit_wscript,
-		struct amount_msat htlc_msatoshi, u32 cltv_expiry,
-		u16 to_self_delay, u32 feerate_per_kw,
-		const struct keyset *keyset, bool option_anchor_outputs,
-		bool option_anchors_zero_fee_htlc_tx)
+struct bitcoin_tx *htlc_timeout_tx(
+    const tal_t *ctx, const struct chainparams *chainparams,
+    const struct bitcoin_outpoint *commit, const u8 *commit_wscript,
+    struct amount_msat htlc_msatoshi, u32 cltv_expiry, u16 to_self_delay,
+    u32 feerate_per_kw, const struct keyset *keyset, bool option_anchor_outputs,
+    bool option_anchors_zero_fee_htlc_tx, bool option_commit_zero_fees)
 {
 	const u8 *htlc_wscript;
 
@@ -130,13 +135,14 @@ htlc_timeout_tx(const tal_t *ctx, const struct chainparams *chainparams,
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
-	return htlc_tx(ctx, chainparams, commit, commit_wscript,
-		       amount_msat_to_sat_round_down(htlc_msatoshi),
-		       htlc_wscript,
-		       htlc_timeout_fee(feerate_per_kw, option_anchor_outputs,
-					option_anchors_zero_fee_htlc_tx),
-		       cltv_expiry, option_anchor_outputs,
-		       option_anchors_zero_fee_htlc_tx);
+	return htlc_tx(
+	    ctx, chainparams, commit, commit_wscript,
+	    amount_msat_to_sat_round_down(htlc_msatoshi), htlc_wscript,
+	    htlc_timeout_fee(feerate_per_kw, option_anchor_outputs,
+			     option_anchors_zero_fee_htlc_tx,
+			     option_commit_zero_fees),
+	    cltv_expiry, option_anchor_outputs, option_anchors_zero_fee_htlc_tx,
+	    option_commit_zero_fees);
 }
 
 /* Fill in the witness for HTLC-timeout tx produced above. */

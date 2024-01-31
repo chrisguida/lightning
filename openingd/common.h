@@ -23,8 +23,10 @@ bool check_config_bounds(const tal_t *ctx, struct amount_sat funding,
 			 const struct channel_config *localconf,
 			 bool option_anchor_outputs,
 			 bool option_anchors_zero_fee_htlc_tx,
+			 bool option_commit_zero_fees,
 			 char **err_reason);
 
+/* Any anchor type, including option_commit_zero_fees */
 bool anchors_negotiated(struct feature_set *our_features,
 			const u8 *their_features);
 

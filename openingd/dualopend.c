@@ -2528,6 +2528,8 @@ static void accepter_start(struct state *state, const u8 *oc2_msg)
 				   OPT_ANCHOR_OUTPUTS),
 		feature_negotiated(state->our_features, state->their_features,
 				   OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+		feature_negotiated(state->our_features, state->their_features,
+				   OPT_COMMIT_ZERO_FEES),
 		&err_reason)) {
 		negotiation_failed(state, "%s", err_reason);
 		return;
@@ -3144,6 +3146,8 @@ static void opener_start(struct state *state, u8 *msg)
 				   OPT_ANCHOR_OUTPUTS),
 		feature_negotiated(state->our_features, state->their_features,
 				   OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+		feature_negotiated(state->our_features, state->their_features,
+				   OPT_COMMIT_ZERO_FEES),
 		&err_reason)) {
 		negotiation_failed(state, "%s", err_reason);
 		return;
@@ -3446,6 +3450,8 @@ static void rbf_local_start(struct state *state, u8 *msg)
 				   OPT_ANCHOR_OUTPUTS),
 		feature_negotiated(state->our_features, state->their_features,
 				   OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+		feature_negotiated(state->our_features, state->their_features,
+				   OPT_COMMIT_ZERO_FEES),
 		&err_reason)) {
 		open_abort(state, "%s", err_reason);
 		return;
@@ -3581,6 +3587,8 @@ static void rbf_remote_start(struct state *state, const u8 *rbf_msg)
 				   OPT_ANCHOR_OUTPUTS),
 		feature_negotiated(state->our_features, state->their_features,
 				   OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+		feature_negotiated(state->our_features, state->their_features,
+				   OPT_COMMIT_ZERO_FEES),
 		&err_reason)) {
 		negotiation_failed(state, "%s", err_reason);
 		goto free_rbf_ctx;

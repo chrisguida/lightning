@@ -305,39 +305,37 @@ static void eltoo_finalize_and_send_last(struct lightningd *ld,
 	assert(ld);
 }
 
-static void eltoo_finalize_and_send_last(struct lightningd *ld,
-					 struct channel *channel)
+static struct bitcoin_tx *
+sign_and_send_last(const tal_t *ctx, struct lightningd *ld,
+		   struct channel *channel, const char *cmd_id,
+		   const struct bitcoin_tx *last_tx,
+		   const struct bitcoin_signature *last_sig)
 {
-	struct bitcoin_tx **bound_update_and_settle_txs;
 	struct bitcoin_txid txid;
+	struct anchor_details *adet;
+	struct bitcoin_tx *tx;
 
-	/* Eltoo keyset should probably have all pubkeys... */
-	bound_update_and_settle_txs = bind_txs_to_funding_outpoint(
-	    channel->eltoo_keyset.complete_update_tx, &channel->funding,
-	    channel->eltoo_keyset.complete_settle_tx,
-	    &channel->eltoo_keyset.last_complete_state.self_psig,
-	    &channel->eltoo_keyset.last_complete_state.other_psig,
-	    &channel->local_funding_pubkey,
-	    &channel->channel_info.remote_fundingkey,
-	    &channel->eltoo_keyset.last_complete_state.session);
+	tx = sign_last_tx(ctx, channel, last_tx, last_sig);
+	bitcoin_txid(tx, &txid);
+	wallet_transaction_add(ld->wallet, tx->wtx, 0, 0);
+	wallet_extract_owned_outputs(ld->wallet, tx->wtx, false, NULL, NULL);
 
-	/* N.B. txid instability possible with eltoo, need to handle? */
-	bitcoin_txid(bound_update_and_settle_txs[0], &txid);
-
-	wallet_transaction_add(ld->wallet, bound_update_and_settle_txs[0]->wtx,
-			       0, 0);
-	wallet_transaction_annotate(
-	    ld->wallet, &txid,
-	    TX_CHANNEL_UNILATERAL /* FIXME What should this be anyways? */,
-	    channel->dbid);
+	/* Remember anchor information for commit_tx_boost */
+	adet = create_anchor_details(NULL, channel, tx);
+	if (!adet)
+		log_debug(channel->log, "We have no anchors to boost for %s",
+			  type_to_string(tmpctx, struct bitcoin_txid, &txid));
 
 	/* Keep broadcasting until we say stop (can fail due to dup,
 	 * if they beat us to the broadcast). */
-	broadcast_tx(ld->topology, channel, last_tx, NULL);
+	// FIXME figure out if we can submitpackage here using adet
+	// do commit_tx_send_finished stuff first, then submit all at once
+	// or batch during the callback
+	broadcast_tx(channel, ld->topology, channel, tx, cmd_id, false, 0,
+		     commit_tx_send_finished, NULL, take(adet));
 
 	return tx;
 }
-
 /* FIXME: reorder! */
 static enum watch_result funding_spent(struct channel *channel,
 				       const struct bitcoin_tx *tx,
@@ -614,7 +612,8 @@ static void json_add_htlcs(struct lightningd *ld, struct json_stream *response,
 			REMOTE, hin->msat, local_feerate,
 			channel->our_config.dust_limit, LOCAL,
 			channel_has(channel, OPT_ANCHOR_OUTPUTS),
-			channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX)))
+			channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+			channel_has(channel, OPT_COMMIT_ZERO_FEES)))
 			json_add_bool(response, "local_trimmed", true);
 		if (hin->status != NULL)
 			json_add_string(response, "status", hin->status);
@@ -638,7 +637,8 @@ static void json_add_htlcs(struct lightningd *ld, struct json_stream *response,
 			LOCAL, hout->msat, local_feerate,
 			channel->our_config.dust_limit, LOCAL,
 			channel_has(channel, OPT_ANCHOR_OUTPUTS),
-			channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX)))
+			channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX),
+			channel_has(channel, OPT_COMMIT_ZERO_FEES)))
 			json_add_bool(response, "local_trimmed", true);
 		json_object_end(response);
 	}
@@ -662,6 +662,12 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 	bool option_anchor_outputs = channel_has(channel, OPT_ANCHOR_OUTPUTS);
 	bool option_anchors_zero_fee_htlc_tx =
 	    channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX);
+	bool option_commit_zero_fees =
+	    channel_has(channel, OPT_COMMIT_ZERO_FEES);
+
+	// No fees required
+	if (option_commit_zero_fees)
+		return fee;
 
 	if (side == LOCAL)
 		dust_limit = channel->our_config.dust_limit;
@@ -669,9 +675,9 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 		dust_limit = channel->channel_info.their_config.dust_limit;
 
 	/* Assume we tried to add "amount" */
-	if (!htlc_is_trimmed(side, amount, feerate, dust_limit, side,
-			     option_anchor_outputs,
-			     option_anchors_zero_fee_htlc_tx))
+	if (!htlc_is_trimmed(
+		side, amount, feerate, dust_limit, side, option_anchor_outputs,
+		option_anchors_zero_fee_htlc_tx, option_commit_zero_fees))
 		num_untrimmed_htlcs++;
 
 	for (hin = htlc_in_map_first(ld->htlcs_in, &ini); hin;
@@ -680,7 +686,8 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 			continue;
 		if (!htlc_is_trimmed(!side, hin->msat, feerate, dust_limit,
 				     side, option_anchor_outputs,
-				     option_anchors_zero_fee_htlc_tx))
+				     option_anchors_zero_fee_htlc_tx,
+				     option_commit_zero_fees))
 			num_untrimmed_htlcs++;
 	}
 	for (hout = htlc_out_map_first(ld->htlcs_out, &outi); hout;
@@ -689,7 +696,8 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 			continue;
 		if (!htlc_is_trimmed(side, hout->msat, feerate, dust_limit,
 				     side, option_anchor_outputs,
-				     option_anchors_zero_fee_htlc_tx))
+				     option_anchors_zero_fee_htlc_tx,
+				     option_commit_zero_fees))
 			num_untrimmed_htlcs++;
 	}
 
@@ -705,9 +713,9 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 	 *   handle twice the current `feerate_per_kw` to ensure
 	 *   predictability between implementations.
 	 */
-	fee = commit_tx_base_fee(2 * feerate, num_untrimmed_htlcs + 1,
-				 option_anchor_outputs,
-				 option_anchors_zero_fee_htlc_tx);
+	fee = commit_tx_base_fee(
+	    2 * feerate, num_untrimmed_htlcs + 1, option_anchor_outputs,
+	    option_anchors_zero_fee_htlc_tx, option_commit_zero_fees);
 
 	if (option_anchor_outputs || option_anchors_zero_fee_htlc_tx) {
 		/* BOLT #3:
