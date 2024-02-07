@@ -1222,7 +1222,7 @@ static void handle_dev_memleak(struct eltoo_state *state, const u8 *msg)
 	/* If there's anything left, dump it to logs, and return true. */
 	found_leak = dump_memleak(memtable, memleak_status_broken, NULL);
 	wire_sync_write(REQ_FD,
-			take(towire_openingd_dev_memleak_reply(NULL,
+			take(towire_openingd_eltoo_dev_memleak_reply(NULL,
 							      found_leak)));
 }
 

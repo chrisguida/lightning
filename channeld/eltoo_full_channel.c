@@ -22,13 +22,11 @@
   /* Needs to be at end, since it doesn't include its own hdrs */
   #include "full_channel_error_names_gen.h"
 
-#if DEVELOPER
 static void memleak_help_htlcmap(struct htable *memtable,
 				 struct htlc_map *htlcs)
 {
-	memleak_remove_htable(memtable, &htlcs->raw);
+	memleak_scan_htable(memtable, &htlcs->raw);
 }
-#endif /* DEVELOPER */
 
 /* This is a dangerous thing!  Because we apply HTLCs in many places
  * in bulk, we can temporarily go negative.  You must check balance_ok()
@@ -279,9 +277,9 @@ struct bitcoin_tx **eltoo_channel_txs(const tal_t *ctx,
     /* Set the remote/local pubkeys on the update tx psbt FIXME add
       inner pubkey when possible */
     psbt_input_add_pubkey(txs[0]->psbt, 0,
-                  &channel->eltoo_keyset.self_funding_key);
+                  &channel->eltoo_keyset.self_funding_key, true);
     psbt_input_add_pubkey(txs[0]->psbt, 0,
-                  &channel->eltoo_keyset.other_funding_key);
+                  &channel->eltoo_keyset.other_funding_key, true);
 
     tal_free(committed);
     return txs;

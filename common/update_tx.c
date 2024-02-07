@@ -392,7 +392,7 @@ struct bitcoin_tx *unbound_update_tx(const tal_t *ctx,
     int pos;
 
     /* 1 input 1 output tx */
-    update_tx = bitcoin_tx(ctx, chainparams, 1, 2, 0);
+    update_tx = bitcoin_tx(ctx, chainparams, 1, 2, 0, 3);
 
     /* Add output */
     pos = tx_add_state_output(update_tx, settle_tx);

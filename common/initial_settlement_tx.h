@@ -37,7 +37,8 @@ struct bitcoin_tx *initial_settlement_tx(const tal_t *ctx,
 
 
 /* We always add a single ephemeral anchor output to settlement transactions */
-void tx_add_ephemeral_anchor_output(struct bitcoin_tx *tx);
+void tx_add_ephemeral_anchor_output(struct bitcoin_tx *tx,
+              struct amount_sat to_anchor);
 
 int tx_add_to_node_output(struct bitcoin_tx *tx, const struct eltoo_keyset *eltoo_keyset, struct amount_msat pay, enum side receiver);
 

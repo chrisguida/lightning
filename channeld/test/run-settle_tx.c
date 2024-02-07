@@ -97,7 +97,7 @@ static struct secret secret_from_hex(const char *hex)
 	return s;
 }
 
-static struct bip340sig musig_sign(struct bitcoin_tx *update_tx, u8 *annex, struct privkey *alice_privkey, struct privkey *bob_privkey, struct pubkey *inner_pubkey, secp256k1_musig_keyagg_cache *keyagg_cache)
+static struct bip340sig musig_sign(struct bitcoin_tx *update_tx, u8 *annex, struct privkey *alice_privkey, struct privkey *bob_privkey, struct privkey *alice_pubkey, struct privkey *bob_pubkey, struct pubkey *inner_pubkey, secp256k1_musig_keyagg_cache *keyagg_cache)
 {
     const secp256k1_musig_pubnonce *pubnonce_ptrs[2];
     struct sha256_double msg_out;
@@ -116,6 +116,7 @@ static struct bip340sig musig_sign(struct bitcoin_tx *update_tx, u8 *annex, stru
         bipmusig_gen_nonce(&secnonce[i],
                &pubnonces[i],
                (i == 0) ? alice_privkey : bob_privkey,
+               (i == 0) ? alice_pubkey : bob_pubkey,
                &keyagg_cache[i],
                /* msg32 */ NULL);
         pubnonce_ptrs[i] = &pubnonces[i];
@@ -578,7 +579,7 @@ static int test_invalid_update_tx(void)
 
     /* Signing happens next */
     annex_0 = make_eltoo_annex(tmpctx, tx);
-    sig = musig_sign(update_tx, annex_0, &alice_funding_privkey, &bob_funding_privkey, &inner_pubkey, keyagg_cache);
+    sig = musig_sign(update_tx, annex_0, &alice_funding_privkey, &bob_funding_privkey, &eltoo_keyset.self_funding_key, &eltoo_keyset.other_funding_key, &inner_pubkey, keyagg_cache);
 
     /* Re-bind, add final script/tapscript info into PSBT */
     bind_tx_to_funding_outpoint(update_tx,
@@ -622,7 +623,7 @@ static int test_invalid_update_tx(void)
 
     /* Authorize this next state update */
     annex_1 = make_eltoo_annex(tmpctx, settle_tx_1);
-    sig = musig_sign(update_tx_1_A, annex_1, &alice_funding_privkey, &bob_funding_privkey, &inner_pubkey, keyagg_cache);
+    sig = musig_sign(update_tx_1_A, annex_1, &alice_funding_privkey, &bob_funding_privkey, &eltoo_keyset.self_funding_key, &eltoo_keyset.other_funding_key, &inner_pubkey, keyagg_cache);
 
     /* This can RBF the first update tx */
     bind_tx_to_funding_outpoint(update_tx_1_A,
@@ -747,7 +748,7 @@ static int test_initial_settlement_tx(void)
 
     /* Signing happens next */
     annex = make_eltoo_annex(tmpctx, tx);
-    sig = musig_sign(update_tx, annex, &alice_funding_privkey, &bob_funding_privkey, &inner_pubkey, keyagg_cache);
+    sig = musig_sign(update_tx, annex, &alice_funding_privkey, &bob_funding_privkey, &eltoo_keyset.self_funding_key, &eltoo_keyset.other_funding_key, &inner_pubkey, keyagg_cache);
 
     /* We want to close the channel without cooperation... time to rebind and finalize */
 

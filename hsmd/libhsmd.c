@@ -978,6 +978,8 @@ static u8 *handle_gen_nonce(struct hsmd_client *c, const u8 *msg_in)
 	struct nonce local_pub_nonce;
 	struct channel_id channel_id;
 	struct musig_state *new_musig_state;
+	struct pubkey *funding_pubkey;
+	int ok;
 
 	if (!fromwire_hsmd_gen_nonce(msg_in, &channel_id))
 		return hsmd_status_malformed_request(c, msg_in);
@@ -993,9 +995,14 @@ static u8 *handle_gen_nonce(struct hsmd_client *c, const u8 *msg_in)
 	get_channel_seed(&c->id, c->dbid, &channel_seed);
 	derive_basepoints(&channel_seed, NULL, NULL, &secrets, NULL);
 
+	ok = pubkey_from_privkey(&secrets.funding_privkey,
+             funding_pubkey);
+    assert(ok);
+
 	/* Fill and return own next_nonce */
 	bipmusig_gen_nonce(&new_musig_state->sec_nonce, &local_pub_nonce.nonce,
-			   &secrets.funding_privkey, NULL /* keyagg_cache */,
+			   &secrets.funding_privkey, funding_pubkey,
+			   NULL /* keyagg_cache */,
 			   NULL /* msg32 */);
 
 	/* Store secret nonce in hash table */
@@ -1791,6 +1798,8 @@ static u8 *handle_psign_update_tx(struct hsmd_client *c, const u8 *msg_in)
 	u8 *annex;
 	struct sha256_double hash_out;
 	struct musig_state *musig_state_lookup;
+	struct pubkey *funding_pubkey;
+	int ok;
 
 	int i;
 
@@ -1852,10 +1861,15 @@ static u8 *handle_psign_update_tx(struct hsmd_client *c, const u8 *msg_in)
 			      /* num_signers */ 2, &hash_out, &cache.cache,
 			      &session.session, &p_sig.p_sig);
 
+	ok = pubkey_from_privkey(&secrets.funding_privkey,
+             funding_pubkey);
+    assert(ok);
+
 	/* Refill and return own next_nonce, using RNG+extra stuff for more
 	 * security */
 	bipmusig_gen_nonce(&musig_state_lookup->sec_nonce, &local_nonce.nonce,
-			   &secrets.funding_privkey, &cache.cache,
+			   &secrets.funding_privkey, funding_pubkey,
+			   &cache.cache,
 			   hash_out.sha.u.u8);
 
 	return towire_hsmd_psign_update_tx_reply(
@@ -1872,6 +1886,8 @@ static u8 *handle_regen_nonce(struct hsmd_client *c, const u8 *msg_in)
 	struct secret channel_seed;
 	struct secrets secrets;
 	struct nonce fresh_nonce;
+	struct pubkey *funding_pubkey;
+	int ok;
 
 	if (!fromwire_hsmd_regen_nonce(msg_in, &channel_id))
 		return hsmd_status_malformed_request(c, msg_in);
@@ -1886,9 +1902,14 @@ static u8 *handle_regen_nonce(struct hsmd_client *c, const u8 *msg_in)
 		    c, msg_in, "No secret nonce found for this regen request");
 	}
 
+	ok = pubkey_from_privkey(&secrets.funding_privkey,
+             funding_pubkey);
+    assert(ok);
+
 	bipmusig_gen_nonce(
 	    &musig_state_lookup->sec_nonce, &fresh_nonce.nonce,
-	    &secrets.funding_privkey, NULL /* keyagg_cache */,
+	    &secrets.funding_privkey, funding_pubkey,
+		NULL /* keyagg_cache */,
 	    channel_id.id /* doesn't hurt; not strictly needed */);
 
 	return towire_hsmd_regen_nonce_reply(NULL, &fresh_nonce);

@@ -51,6 +51,11 @@
 #define MASTER_FD STDIN_FILENO
 #define HSM_FD 4
 
+#define VALID_STFU_MESSAGE(msg)                                                \
+	((msg) == WIRE_SPLICE || (msg) == WIRE_SPLICE_ACK)
+
+#define SAT_MIN(a, b) (amount_sat_less((a), (b)) ? (a) : (b))
+
 struct eltoo_peer {
 	struct per_peer_state *pps;
 	bool funding_locked[NUM_SIDES];
@@ -116,28 +121,28 @@ struct eltoo_peer {
 	/* If master told us to send wrong_funding */
 	struct bitcoin_outpoint *shutdown_wrong_funding;
 
-#if EXPERIMENTAL_FEATURES
 	/* Do we want quiescence? */
-	bool stfu;
+	bool want_stfu;
 	/* Which side is considered the initiator? */
 	enum side stfu_initiator;
 	/* Has stfu been sent by each side? */
 	bool stfu_sent[NUM_SIDES];
+	/* After STFU mode is enabled, wait for a single message flag */
+	bool stfu_wait_single_msg;
 	/* Updates master asked, which we've deferred while quiescing */
 	struct msg_queue *update_queue;
+	/* Callback for when when stfu is negotiated successfully */
+	void (*on_stfu_success)(struct eltoo_peer *);
 	/* Who's turn is it? */
     enum side turn;
     /* Can we yield? i.e. have we not yet sent updates during our turn? (or not our turn at all) */
     bool can_yield;
-#endif
-
-#if DEVELOPER
 	/* If set, don't fire commit counter when this hits 0 */
 	u32 *dev_disable_commit;
 
 	/* If set, send channel_announcement after 1 second, not 30 */
 	bool dev_fast_gossip;
-#endif
+
 	/* Information used for reestablishment. */
 	struct changed_htlc *last_sent_commit;
 	bool sent_uncommitted_removals; /* Have we sent uncommitted removals on reconnect? */
@@ -218,13 +223,22 @@ const u8 *hsm_req(const tal_t *ctx, const u8 *req TAKES)
 	return msg;
 }
 
-#if EXPERIMENTAL_FEATURES
+static bool is_stfu_active(const struct eltoo_peer *peer)
+{
+	return peer->stfu_sent[LOCAL] && peer->stfu_sent[REMOTE];
+}
+
 static void maybe_send_stfu(struct eltoo_peer *peer)
 {
-	if (!peer->stfu)
+	if (!peer->want_stfu)
 		return;
 
-	if (!peer->stfu_sent[LOCAL] && !pending_updates(peer->channel, LOCAL, false)) {
+	if (pending_updates(peer->channel, LOCAL, false)) {
+		status_info("Pending updates prevent us from STFU mode at this"
+			    " time.");
+	}
+	else if (!peer->stfu_sent[LOCAL]) {
+		status_debug("Sending peer that we want to STFU.");
 		u8 *msg = towire_stfu(NULL, &peer->channel_id,
 				      peer->stfu_initiator == LOCAL);
 		peer_write(peer->pps, take(msg));
@@ -232,9 +246,21 @@ static void maybe_send_stfu(struct eltoo_peer *peer)
 	}
 
 	if (peer->stfu_sent[LOCAL] && peer->stfu_sent[REMOTE]) {
+		/* Prevent STFU mode being inadvertantly activated twice during
+		 * splice. This occurs because the commit -> revoke_and_ack
+		 * cycle calls into `maybe_send_stfu`. The `want_stfu` flag is
+		 * to prevent triggering the entering of stfu events twice. */
+		peer->want_stfu = false;
 		status_unusual("STFU complete: we are quiescent");
 		wire_sync_write(MASTER_FD,
 				towire_channeld_dev_quiesce_reply(tmpctx));
+
+		peer->stfu_wait_single_msg = true;
+		status_unusual("STFU complete: setting stfu_wait_single_msg = true");
+		if (peer->on_stfu_success) {
+			peer->on_stfu_success(peer);
+			peer->on_stfu_success = NULL;
+		}
 	}
 }
 
@@ -261,8 +287,8 @@ static void handle_stfu(struct eltoo_peer *peer, const u8 *stfu)
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "STFU but you still have updates pending?");
 
-	if (!peer->stfu) {
-		peer->stfu = true;
+	if (!peer->want_stfu) {
+		peer->want_stfu = true;
 		if (!remote_initiated)
 			peer_failed_warn(peer->pps, &peer->channel_id,
 					 "Unsolicited STFU but you said"
@@ -301,7 +327,7 @@ static bool is_our_turn(const struct eltoo_peer *peer)
 /* Returns true if we queued this for later handling (steals if true) */
 static bool handle_master_request_later(struct eltoo_peer *peer, const u8 *msg)
 {
-	if (peer->stfu) {
+	if (peer->want_stfu) {
 		status_debug("queueing master update for later...");
 		msg_enqueue(peer->update_queue, take(msg));
 		return true;
@@ -319,25 +345,12 @@ static bool handle_master_request_later(struct eltoo_peer *peer, const u8 *msg)
     return false;
 }
 
-#else /* !EXPERIMENTAL_FEATURES */
-static bool handle_master_request_later(struct eltoo_peer *peer, const u8 *msg)
-{
-	return false;
-}
-
-static void maybe_send_stfu(struct eltoo_peer *peer)
-{
-}
-#endif
-
 /* Tell gossipd to create channel_update (then it goes into
  * gossip_store, then streams out to peers, or sends it directly if
  * it's a private channel) */
-static void send_channel_update(struct eltoo_peer *peer, int disable_flag)
+static void send_channel_update(struct eltoo_peer *peer, bool enable)
 {
 	u8 *msg;
-
-	assert(disable_flag == 0 || disable_flag == ROUTING_FLAGS_DISABLED);
 
 	/* Only send an update if we told gossipd */
 	if (!peer->channel_local_active)
@@ -345,15 +358,7 @@ static void send_channel_update(struct eltoo_peer *peer, int disable_flag)
 
 	assert(peer->short_channel_ids[LOCAL].u64);
 
-	msg = towire_channeld_local_channel_update(NULL,
-						  &peer->short_channel_ids[LOCAL],
-						  disable_flag
-						  == ROUTING_FLAGS_DISABLED,
-						  peer->cltv_delta,
-						  peer->htlc_minimum_msat,
-						  peer->fee_base,
-						  peer->fee_per_satoshi,
-						  peer->htlc_maximum_msat);
+	msg = towire_channeld_local_channel_update(NULL, enable);
 	wire_sync_write(MASTER_FD, take(msg));
 }
 
@@ -648,38 +653,27 @@ static void handle_peer_add_htlc(struct eltoo_peer *peer, const u8 *msg)
 	struct sha256 payment_hash;
 	u8 onion_routing_packet[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)];
 	enum channel_add_err add_err;
-	struct htlc *htlc;
-#if EXPERIMENTAL_FEATURES
-	struct tlv_update_add_tlvs *tlvs;
-#endif
-	struct pubkey *blinding = NULL;
+	struct tlv_update_add_htlc_tlvs *tlvs;
 
-	if (!fromwire_update_add_htlc
-#if EXPERIMENTAL_FEATURES
-	    (msg, msg, &channel_id, &id, &amount,
-	     &payment_hash, &cltv_expiry,
-	     onion_routing_packet, &tlvs)
-#else
-	    (msg, &channel_id, &id, &amount,
-	     &payment_hash, &cltv_expiry,
-	     onion_routing_packet)
-#endif
-		)
+	if (!fromwire_update_add_htlc(msg, msg, &channel_id, &id, &amount,
+				      &payment_hash, &cltv_expiry,
+				      onion_routing_packet, &tlvs)
+	    /* This is an *even* field: don't send if we didn't understand */
+	    || (tlvs->blinding_point && !feature_offered(peer->our_features->bits[INIT_FEATURE],
+							 OPT_ROUTE_BLINDING))) {
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad peer_add_htlc %s", tal_hex(msg, msg));
-
-#if EXPERIMENTAL_FEATURES
-	blinding = tlvs->blinding;
-#endif
-	add_err = eltoo_channel_add_htlc(peer->channel, REMOTE, id, amount,
-				   cltv_expiry, &payment_hash,
-				   onion_routing_packet, blinding, &htlc,
-				   /* err_immediate_failures */ false);
+	}
+	add_err = eltoo_channel_add_htlc(peer->channel, LOCAL, peer->htlc_id,
+			     amount, cltv_expiry, &payment_hash,
+			     onion_routing_packet, tlvs->blinding_point, NULL,
+			     true);
 	if (add_err != CHANNEL_ERR_ADD_OK)
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad peer_add_htlc: %s",
 				 channel_add_err_name(add_err));
 }
+
 
 static struct changed_htlc *changed_htlc_arr(const tal_t *ctx,
 					     const struct htlc **changed_htlcs)
@@ -861,12 +855,10 @@ static void send_update(struct eltoo_peer *peer)
 	struct wally_tx_output *direct_outputs[NUM_SIDES];
 	struct musig_keyagg_cache cache;
 
-#if DEVELOPER
 	if (peer->dev_disable_commit && !*peer->dev_disable_commit) {
 		peer->commit_timer = NULL;
 		return;
 	}
-#endif
 
 	/* We can't send two commits in a row. */
 	if (peer->sigs_received != peer->next_index - 1) {
@@ -973,13 +965,11 @@ static void send_update(struct eltoo_peer *peer)
     peer->channel->eltoo_keyset.committed_update_tx = tal_steal(peer->channel, update_and_settle_txs[0]);
     peer->channel->eltoo_keyset.committed_settle_tx = tal_steal(peer->channel, update_and_settle_txs[1]);
 
-#if DEVELOPER
 	if (peer->dev_disable_commit) {
 		(*peer->dev_disable_commit)--;
 		if (*peer->dev_disable_commit == 0)
 			status_unusual("dev-disable-commit-after: disabling");
 	}
-#endif
 
 	status_debug("Telling master we're about to update...");
 	/* Tell master to save this next commit to database, then wait. */
@@ -1022,6 +1012,18 @@ static void send_update(struct eltoo_peer *peer)
 	start_update_timer(peer);
 }
 
+static void send_update_if_not_stfu(struct eltoo_peer *peer)
+{
+	if (!is_stfu_active(peer) && !peer->want_stfu) {
+		send_update(peer);
+	} else {
+		/* Timer now considered expired, you can add a new one. */
+		peer->commit_timer = NULL;
+		start_update_timer(peer);
+	}
+}
+
+
 static void start_update_timer(struct eltoo_peer *peer)
 {
 	/* Already armed? */
@@ -1030,7 +1032,7 @@ static void start_update_timer(struct eltoo_peer *peer)
 
 	peer->commit_timer = new_reltimer(&peer->timers, peer,
 					  time_from_msec(peer->commit_msec),
-					  send_update, peer);
+					  send_update_if_not_stfu, peer);
 }
 
 static u8 *make_update_signed_ack_msg(const struct eltoo_peer *peer,
@@ -1065,11 +1067,7 @@ static void marshall_htlc_info(const tal_t *ctx,
 			memcpy(a.onion_routing_packet,
 			       htlc->routing,
 			       sizeof(a.onion_routing_packet));
-			if (htlc->blinding) {
-				a.blinding = htlc->blinding;
-				ecdh(a.blinding, &a.blinding_ss);
-			} else
-				a.blinding = NULL;
+			a.blinding = htlc->blinding;
 			a.fail_immediate = htlc->fail_immediate;
 			tal_arr_expand(added, a);
 		} else if (htlc->state == RCVD_REMOVE_UPDATE) {
@@ -1604,6 +1602,33 @@ static void handle_peer_shutdown(struct eltoo_peer *peer, const u8 *shutdown)
 	billboard_update(peer);
 }
 
+static void handle_unexpected_tx_sigs(struct eltoo_peer *peer, const u8 *msg)
+{
+	const struct witness **witnesses;
+	struct channel_id cid;
+	struct bitcoin_txid txid;
+
+	struct tlv_txsigs_tlvs *txsig_tlvs = tlv_txsigs_tlvs_new(tmpctx);
+
+	/* In a rare case, a v2 peer may re-send a tx_sigs message.
+	 * This happens when they've/we've exchanged channel_ready,
+	 * but they did not receive our channel_ready. */
+	if (!fromwire_tx_signatures(tmpctx, msg, &cid, &txid,
+				    cast_const3(struct witness ***, &witnesses),
+				    &txsig_tlvs))
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "Bad tx_signatures %s", tal_hex(msg, msg));
+
+	status_info("Unexpected `tx_signatures` from peer-> %s",
+		    peer->tx_sigs_allowed ? "Allowing." : "Failing.");
+
+	if (!peer->tx_sigs_allowed)
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "Unexpected `tx_signatures`");
+
+	peer->tx_sigs_allowed = false;
+}
+
 static void handle_unexpected_reestablish(struct eltoo_peer *peer, const u8 *msg)
 {
 	struct channel_id channel_id;
@@ -1746,7 +1771,7 @@ static void peer_in(struct eltoo_peer *peer, const u8 *msg)
 {
 	enum peer_wire type = fromwire_peektype(msg);
 
-	if (handle_peer_error(peer->pps, &peer->channel_id, msg))
+	if (handle_peer_error_or_warning(peer->pps, msg))
 		return;
 
 	/* Must get funding_locked before almost anything. */
@@ -1772,35 +1797,44 @@ static void peer_in(struct eltoo_peer *peer, const u8 *msg)
         return;
     }
 
+	/* For cleaner errors, we check message is valid during STFU mode */
+	if (peer->stfu_wait_single_msg)
+		if (!VALID_STFU_MESSAGE(type))
+			peer_failed_warn(peer->pps, &peer->channel_id,
+					 "Got invalid message during STFU "
+					 "mode: %s",
+					 peer_wire_name(type));
+
+	peer->stfu_wait_single_msg = false;
+
 	switch (type) {
+	/* FIXME How should we handle illegal messages in general? */
+	case WIRE_CHANNEL_READY:
+   	case WIRE_COMMITMENT_SIGNED:
+	case WIRE_UPDATE_FEE:
+	case WIRE_UPDATE_BLOCKHEIGHT:
+	case WIRE_REVOKE_AND_ACK:
+	case WIRE_SPLICE:
+	case WIRE_SPLICE_ACK:
+	case WIRE_SPLICE_LOCKED:
+        /* FIXME How should we handle illegal messages in general? */
+		return;
 	case WIRE_FUNDING_LOCKED_ELTOO:
 		handle_peer_funding_locked_eltoo(peer, msg);
 		return;
+    case WIRE_UPDATE_SIGNED:
+        handle_peer_update_sig(peer, msg);
+        return;
+	case WIRE_UPDATE_SIGNED_ACK:
+		handle_peer_update_sig_ack(peer, msg);
+		return;
 	case WIRE_ANNOUNCEMENT_SIGNATURES:
-        /* untouched */
 		handle_peer_announcement_signatures(peer, msg);
 		return;
 	case WIRE_UPDATE_ADD_HTLC:
 		handle_peer_add_htlc(peer, msg);
 		return;
-   	case WIRE_COMMITMENT_SIGNED:
-        /* FIXME How should we handle illegal messages in general? */
-		return;
-	case WIRE_UPDATE_FEE:
-        /* FIXME How should we handle illegal messages in general? */
-		return;
-    case WIRE_UPDATE_SIGNED:
-        handle_peer_update_sig(peer, msg);
-        return;
-	case WIRE_UPDATE_BLOCKHEIGHT:
-        /* FIXME How should we handle illegal messages in general? */
-		return;
-	case WIRE_REVOKE_AND_ACK:
-        /* FIXME How should we handle illegal messages in general? */
-		return;
-	case WIRE_UPDATE_SIGNED_ACK:
-		handle_peer_update_sig_ack(peer, msg);
-		return;
+
 	case WIRE_UPDATE_FULFILL_HTLC:
 		handle_peer_fulfill_htlc(peer, msg);
 		return;
@@ -1813,6 +1847,9 @@ static void peer_in(struct eltoo_peer *peer, const u8 *msg)
 	case WIRE_SHUTDOWN:
 		handle_peer_shutdown(peer, msg);
 		return;
+	case WIRE_STFU:
+		handle_stfu(peer, msg);
+		return;
     case WIRE_UPDATE_NOOP:
 		/* 
 		 *- if it received `update_noop`:
@@ -1822,12 +1859,6 @@ static void peer_in(struct eltoo_peer *peer, const u8 *msg)
     case WIRE_YIELD:
 		handle_yield(peer, msg);
         return;
-
-#if EXPERIMENTAL_FEATURES
-	case WIRE_STFU:
-		handle_stfu(peer, msg);
-		return;
-#endif
 	case WIRE_INIT:
 	case WIRE_OPEN_CHANNEL:
 	case WIRE_ACCEPT_CHANNEL:
@@ -1839,11 +1870,16 @@ static void peer_in(struct eltoo_peer *peer, const u8 *msg)
 	case WIRE_TX_ADD_OUTPUT:
 	case WIRE_TX_REMOVE_OUTPUT:
 	case WIRE_TX_COMPLETE:
+	case WIRE_TX_ABORT:
 	case WIRE_OPEN_CHANNEL2:
 	case WIRE_ACCEPT_CHANNEL2:
 	case WIRE_TX_SIGNATURES:
-	case WIRE_INIT_RBF:
-	case WIRE_ACK_RBF:
+		handle_unexpected_tx_sigs(peer, msg);
+		return;
+	case WIRE_TX_INIT_RBF:
+	case WIRE_TX_ACK_RBF:
+		break;
+
 	case WIRE_CHANNEL_REESTABLISH:
 		break;
 	case WIRE_CHANNEL_REESTABLISH_ELTOO:
@@ -1863,10 +1899,10 @@ static void peer_in(struct eltoo_peer *peer, const u8 *msg)
 	case WIRE_PONG:
 	case WIRE_WARNING:
 	case WIRE_ERROR:
-	case WIRE_OBS2_ONION_MESSAGE:
 	case WIRE_ONION_MESSAGE:
-    case WIRE_FUNDING_LOCKED:
-    /* Eltoo stuff */
+	case WIRE_PEER_STORAGE:
+	case WIRE_YOUR_PEER_STORAGE:
+	/* Eltoo stuff */
     case WIRE_OPEN_CHANNEL_ELTOO:
     case WIRE_ACCEPT_CHANNEL_ELTOO:
     case WIRE_FUNDING_CREATED_ELTOO:
@@ -1874,7 +1910,6 @@ static void peer_in(struct eltoo_peer *peer, const u8 *msg)
     case WIRE_SHUTDOWN_ELTOO:
     case WIRE_CLOSING_SIGNED_ELTOO:
     /* Eltoo stuff ends */
-
 		abort();
 	}
 
@@ -2001,28 +2036,22 @@ static void resend_updates(struct eltoo_peer *peer, struct changed_htlc *last)
                      "Can't find HTLC %"PRIu64" to resend",
                      last[i].id);
 
-        if (h->state == SENT_ADD_UPDATE) {
-#if EXPERIMENTAL_FEATURES
-            struct tlv_update_add_tlvs *tlvs;
-            if (h->blinding) {
-                tlvs = tlv_update_add_tlvs_new(tmpctx);
-                tlvs->blinding = tal_dup(tlvs, struct pubkey,
-                             h->blinding);
-            } else
-                tlvs = NULL;
-#endif
-            u8 *msg = towire_update_add_htlc(NULL, &peer->channel_id,
-                             h->id, h->amount,
-                             &h->rhash,
-                             abs_locktime_to_blocks(
-                                 &h->expiry),
-                             h->routing
-#if EXPERIMENTAL_FEATURES
-                             , tlvs
-#endif
-                );
-            peer_write(peer->pps, take(msg));
-        }
+		if (h->state == SENT_ADD_UPDATE) {
+			struct tlv_update_add_htlc_tlvs *tlvs;
+			if (h->blinding) {
+				tlvs = tlv_update_add_htlc_tlvs_new(tmpctx);
+				tlvs->blinding_point = tal_dup(tlvs, struct pubkey,
+							       h->blinding);
+			} else
+				tlvs = NULL;
+			msg = towire_update_add_htlc(NULL, &peer->channel_id,
+						     h->id, h->amount,
+						     &h->rhash,
+						     abs_locktime_to_blocks(
+							     &h->expiry),
+						     h->routing, tlvs);
+			peer_write(peer->pps, take(msg));
+		}
     }
 
 	/* No fee information required */
@@ -2170,8 +2199,8 @@ static void peer_reconnect(struct eltoo_peer *peer,
                           "Expected reestablish, got: %s",
                           tal_hex(tmpctx, msg));
         }
-    } while (handle_peer_error(peer->pps, &peer->channel_id, msg) ||
-         capture_premature_msg(&premature_msgs, msg));
+	} while (handle_peer_error_or_warning(peer->pps, msg) ||
+		 capture_premature_msg(&premature_msgs, msg));
 
 
 	/* Their psig might be for our complete state
@@ -2192,7 +2221,6 @@ static void peer_reconnect(struct eltoo_peer *peer,
     if (peer->funding_locked[LOCAL]
         && last_update_num == 0
         && remote_last_update_num == 0) {
-        u8 *msg;
 
         status_debug("Retransmitting funding_locked_eltoo for channel %s",
                      type_to_string(tmpctx, struct channel_id, &peer->channel_id));
@@ -2336,12 +2364,12 @@ static void peer_reconnect(struct eltoo_peer *peer,
 static void handle_funding_depth(struct eltoo_peer *peer, const u8 *msg)
 {
 	u32 depth;
-	struct short_channel_id *scid;
+	struct short_channel_id *scid, *alias_local;
+	bool splicing;
+	struct bitcoin_txid txid;
 
-	if (!fromwire_channeld_funding_depth(tmpctx,
-					    msg,
-					    &scid,
-					    &depth))
+	if (!fromwire_channeld_funding_depth(tmpctx, msg, &scid, &alias_local,
+					     &depth, &splicing, &txid))
 		master_badmsg(WIRE_CHANNELD_FUNDING_DEPTH, msg);
 
 	/* Too late, we're shutting down! */
@@ -2377,15 +2405,6 @@ static void handle_funding_depth(struct eltoo_peer *peer, const u8 *msg)
 	billboard_update(peer);
 }
 
-static const u8 *get_cupdate(const struct eltoo_peer *peer)
-{
-	/* Technically we only need to tell it the first time (unless it's
-	 * changed).  But it's not that common. */
-	wire_sync_write(MASTER_FD,
-			take(towire_channeld_used_channel_update(NULL)));
-	return peer->channel_update;
-}
-
 static void handle_offer_htlc(struct eltoo_peer *peer, const u8 *inmsg)
 {
 	u8 *msg;
@@ -2396,64 +2415,56 @@ static void handle_offer_htlc(struct eltoo_peer *peer, const u8 *inmsg)
 	enum channel_add_err e;
 	const u8 *failwiremsg;
 	const char *failstr;
+	struct amount_sat htlc_fee;
 	struct pubkey *blinding;
+	struct tlv_update_add_htlc_tlvs *tlvs;
 
 	if (!peer->funding_locked[LOCAL] || !peer->funding_locked[REMOTE])
 		status_failed(STATUS_FAIL_MASTER_IO,
 			      "funding not locked for offer_htlc");
 
-	if (!fromwire_channeld_offer_htlc(tmpctx, inmsg, &amount,
-					 &cltv_expiry, &payment_hash,
-					 onion_routing_packet, &blinding))
+	if (!fromwire_channeld_offer_htlc(tmpctx, inmsg, &amount, &cltv_expiry,
+					  &payment_hash, onion_routing_packet,
+					  &blinding))
 		master_badmsg(WIRE_CHANNELD_OFFER_HTLC, inmsg);
 
-#if EXPERIMENTAL_FEATURES
-	struct tlv_update_add_tlvs *tlvs;
 	if (blinding) {
-		tlvs = tlv_update_add_tlvs_new(tmpctx);
-		tlvs->blinding = tal_dup(tlvs, struct pubkey, blinding);
+		tlvs = tlv_update_add_htlc_tlvs_new(tmpctx);
+		tlvs->blinding_point = tal_dup(tlvs, struct pubkey, blinding);
 	} else
 		tlvs = NULL;
-#endif
 
-	e = eltoo_channel_add_htlc(peer->channel, LOCAL, peer->htlc_id,
-			     amount, cltv_expiry, &payment_hash,
-			     onion_routing_packet, take(blinding), NULL,
-			     true);
-	status_debug("Adding HTLC %"PRIu64" amount=%s cltv=%u gave %s",
+	e = eltoo_channel_add_htlc(peer->channel, LOCAL, peer->htlc_id, amount,
+			     cltv_expiry, &payment_hash, onion_routing_packet,
+			     take(blinding), NULL, true);
+	status_debug("Adding HTLC %" PRIu64 " amount=%s cltv=%u gave %s",
 		     peer->htlc_id,
 		     type_to_string(tmpctx, struct amount_msat, &amount),
-		     cltv_expiry,
-		     channel_add_err_name(e));
+		     cltv_expiry, channel_add_err_name(e));
 
 	switch (e) {
 	case CHANNEL_ERR_ADD_OK:
 		/* Tell the peer. */
-		msg = towire_update_add_htlc(NULL, &peer->channel_id,
-					     peer->htlc_id, amount,
-					     &payment_hash, cltv_expiry,
-					     onion_routing_packet
-#if EXPERIMENTAL_FEATURES
-					     , tlvs
-#endif
-			);
+		msg = towire_update_add_htlc(
+		    NULL, &peer->channel_id, peer->htlc_id, amount,
+		    &payment_hash, cltv_expiry, onion_routing_packet, tlvs);
 		peer_write(peer->pps, take(msg));
 		start_update_timer(peer);
 		/* Tell the master. */
-		msg = towire_channeld_offer_htlc_reply(NULL, peer->htlc_id,
-						      0, "");
+		msg = towire_channeld_offer_htlc_reply(NULL, peer->htlc_id, 0,
+						       "");
 		wire_sync_write(MASTER_FD, take(msg));
 		peer->htlc_id++;
-		peer->can_yield = false;
 		return;
 	case CHANNEL_ERR_INVALID_EXPIRY:
-		failwiremsg = towire_incorrect_cltv_expiry(inmsg, cltv_expiry, get_cupdate(peer));
+		failwiremsg =
+		    towire_incorrect_cltv_expiry(inmsg, cltv_expiry, NULL);
 		failstr = tal_fmt(inmsg, "Invalid cltv_expiry %u", cltv_expiry);
 		goto failed;
 	case CHANNEL_ERR_DUPLICATE:
 	case CHANNEL_ERR_DUPLICATE_ID_DIFFERENT:
-		status_failed(STATUS_FAIL_MASTER_IO,
-			      "Duplicate HTLC %"PRIu64, peer->htlc_id);
+		status_failed(STATUS_FAIL_MASTER_IO, "Duplicate HTLC %" PRIu64,
+			      peer->htlc_id);
 
 	case CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED:
 		failwiremsg = towire_required_node_feature_missing(inmsg);
@@ -2461,28 +2472,31 @@ static void handle_offer_htlc(struct eltoo_peer *peer, const u8 *inmsg)
 		goto failed;
 	/* FIXME: Fuzz the boundaries a bit to avoid probing? */
 	case CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED:
-		failwiremsg = towire_temporary_channel_failure(inmsg, get_cupdate(peer));
-		failstr = tal_fmt(inmsg, "Capacity exceeded");
+		failwiremsg = towire_temporary_channel_failure(inmsg, NULL);
+		failstr = tal_fmt(inmsg, "Capacity exceeded - HTLC fee: %s",
+				  fmt_amount_sat(inmsg, htlc_fee));
 		goto failed;
 	case CHANNEL_ERR_HTLC_BELOW_MINIMUM:
-		failwiremsg = towire_amount_below_minimum(inmsg, amount, get_cupdate(peer));
-		failstr = tal_fmt(inmsg, "HTLC too small (%s minimum)",
-				  type_to_string(tmpctx,
-						 struct amount_msat,
-						 &peer->channel->config[REMOTE].htlc_minimum));
+		failwiremsg = towire_amount_below_minimum(inmsg, amount, NULL);
+		failstr =
+		    tal_fmt(inmsg, "HTLC too small (%s minimum)",
+			    type_to_string(
+				tmpctx, struct amount_msat,
+				&peer->channel->config[REMOTE].htlc_minimum));
 		goto failed;
 	case CHANNEL_ERR_TOO_MANY_HTLCS:
-		failwiremsg = towire_temporary_channel_failure(inmsg, get_cupdate(peer));
+		failwiremsg = towire_temporary_channel_failure(inmsg, NULL);
 		failstr = "Too many HTLCs";
 		goto failed;
 	case CHANNEL_ERR_DUST_FAILURE:
 		/* BOLT-919 #2:
 		 * - upon an outgoing HTLC:
-		 *   - if a HTLC's `amount_msat` is inferior the counterparty's...
+		 *   - if a HTLC's `amount_msat` is inferior the
+		 * counterparty's...
 		 *   - SHOULD NOT send this HTLC
 		 *   - SHOULD fail this HTLC if it's forwarded
 		 */
-		failwiremsg = towire_temporary_channel_failure(inmsg, get_cupdate(peer));
+		failwiremsg = towire_temporary_channel_failure(inmsg, NULL);
 		failstr = "HTLC too dusty, allowed dust limit reached";
 		goto failed;
 	}
@@ -2490,45 +2504,10 @@ static void handle_offer_htlc(struct eltoo_peer *peer, const u8 *inmsg)
 	abort();
 
 failed:
+	/* lightningd appends update to this for us */
 	msg = towire_channeld_offer_htlc_reply(NULL, 0, failwiremsg, failstr);
 	wire_sync_write(MASTER_FD, take(msg));
 }
-
-static void handle_config_channel(struct eltoo_peer *peer, const u8 *inmsg)
-{
-	u32 *base, *ppm;
-	struct amount_msat *htlc_min, *htlc_max;
-	bool changed;
-
-	if (!fromwire_channeld_config_channel(inmsg, inmsg,
-					      &base, &ppm,
-					      &htlc_min,
-					      &htlc_max))
-		master_badmsg(WIRE_CHANNELD_CONFIG_CHANNEL, inmsg);
-
-	/* only send channel updates if values actually changed */
-	changed = false;
-	if (base && *base != peer->fee_base) {
-		peer->fee_base = *base;
-		changed = true;
-	}
-	if (ppm && *ppm != peer->fee_per_satoshi) {
-		peer->fee_per_satoshi = *ppm;
-		changed = true;
-	}
-	if (htlc_min && !amount_msat_eq(*htlc_min, peer->htlc_minimum_msat)) {
-		peer->htlc_minimum_msat = *htlc_min;
-		changed = true;
-	}
-	if (htlc_max && !amount_msat_eq(*htlc_max, peer->htlc_maximum_msat)) {
-		peer->htlc_maximum_msat = *htlc_max;
-		changed = true;
-	}
-
-	if (changed)
-		send_channel_update(peer, 0);
-}
-
 
 static void handle_preimage(struct eltoo_peer *peer, const u8 *inmsg)
 {
@@ -2617,14 +2596,6 @@ static void handle_shutdown_cmd(struct eltoo_peer *peer, const u8 *inmsg)
 	start_update_timer(peer);
 }
 
-/* Lightningd tells us when channel_update has changed. */
-static void handle_channel_update(struct eltoo_peer *peer, const u8 *msg)
-{
-	peer->channel_update = tal_free(peer->channel_update);
-	if (!fromwire_channeld_channel_update(peer, msg, &peer->channel_update))
-		master_badmsg(WIRE_CHANNELD_CHANNEL_UPDATE, msg);
-}
-
 static void handle_send_error(struct eltoo_peer *peer, const u8 *msg)
 {
 	char *reason;
@@ -2639,7 +2610,6 @@ static void handle_send_error(struct eltoo_peer *peer, const u8 *msg)
 			take(towire_channeld_send_error_reply(NULL)));
 }
 
-#if DEVELOPER
 static void handle_dev_reenable_commit(struct eltoo_peer *peer)
 {
 	peer->dev_disable_commit = tal_free(peer->dev_disable_commit);
@@ -2654,15 +2624,15 @@ static void handle_dev_memleak(struct eltoo_peer *peer, const u8 *msg)
 	struct htable *memtable;
 	bool found_leak;
 
-	memtable = memleak_find_allocations(tmpctx, msg, msg);
+	memtable = memleak_start(tmpctx);
+	memleak_ptr(memtable, msg);
 
 	/* Now delete peer and things it has pointers to. */
-	memleak_remove_region(memtable, peer, tal_bytelen(peer));
+	memleak_scan_obj(memtable, peer);
 
-	found_leak = dump_memleak(memtable, memleak_status_broken);
-	wire_sync_write(MASTER_FD,
-			 take(towire_channeld_dev_memleak_reply(NULL,
-							       found_leak)));
+	found_leak = dump_memleak(memtable, memleak_status_broken, NULL);
+	wire_sync_write(MASTER_FD, take(towire_channeld_dev_memleak_reply(
+				       NULL, found_leak)));
 }
 
 /* Unused for now, just take message off wire */
@@ -2687,22 +2657,19 @@ static void handle_blockheight(struct eltoo_peer *peer, const u8 *inmsg)
 }
 
 
-#if EXPERIMENTAL_FEATURES
 static void handle_dev_quiesce(struct eltoo_peer *peer, const u8 *msg)
 {
 	if (!fromwire_channeld_dev_quiesce(msg))
 		master_badmsg(WIRE_CHANNELD_DEV_QUIESCE, msg);
 
 	/* Don't do this twice. */
-	if (peer->stfu)
+	if (peer->want_stfu)
 		status_failed(STATUS_FAIL_MASTER_IO, "dev_quiesce already");
 
-	peer->stfu = true;
+	peer->want_stfu = true;
 	peer->stfu_initiator = LOCAL;
 	maybe_send_stfu(peer);
 }
-#endif /* EXPERIMENTAL_FEATURES */
-#endif /* DEVELOPER */
 
 static void req_in(struct eltoo_peer *peer, const u8 *msg)
 {
@@ -2733,21 +2700,12 @@ static void req_in(struct eltoo_peer *peer, const u8 *msg)
 			return;
 		handle_fail(peer, msg);
 		return;
-	case WIRE_CHANNELD_CONFIG_CHANNEL:
-		if (handle_master_request_later(peer, msg))
-			return;
-		handle_config_channel(peer, msg);
-		return;
 	case WIRE_CHANNELD_SEND_SHUTDOWN:
 		handle_shutdown_cmd(peer, msg);
 		return;
 	case WIRE_CHANNELD_SEND_ERROR:
 		handle_send_error(peer, msg);
 		return;
-	case WIRE_CHANNELD_CHANNEL_UPDATE:
-		handle_channel_update(peer, msg);
-		return;
-#if DEVELOPER
 	case WIRE_CHANNELD_DEV_REENABLE_COMMIT:
 		handle_dev_reenable_commit(peer);
 		return;
@@ -2755,15 +2713,8 @@ static void req_in(struct eltoo_peer *peer, const u8 *msg)
 		handle_dev_memleak(peer, msg);
 		return;
 	case WIRE_CHANNELD_DEV_QUIESCE:
-#if EXPERIMENTAL_FEATURES
 		handle_dev_quiesce(peer, msg);
 		return;
-#endif /* EXPERIMENTAL_FEATURES */
-#else
-	case WIRE_CHANNELD_DEV_REENABLE_COMMIT:
-	case WIRE_CHANNELD_DEV_MEMLEAK:
-	case WIRE_CHANNELD_DEV_QUIESCE:
-#endif /* DEVELOPER */
 	case WIRE_CHANNELD_INIT:
 	case WIRE_CHANNELD_OFFER_HTLC_REPLY:
 	case WIRE_CHANNELD_SENDING_COMMITSIG:
@@ -2772,7 +2723,7 @@ static void req_in(struct eltoo_peer *peer, const u8 *msg)
 	case WIRE_CHANNELD_SENDING_COMMITSIG_REPLY:
 	case WIRE_CHANNELD_GOT_COMMITSIG_REPLY:
 	case WIRE_CHANNELD_GOT_REVOKE_REPLY:
-	case WIRE_CHANNELD_GOT_FUNDING_LOCKED:
+	case WIRE_CHANNELD_GOT_CHANNEL_READY:
 	case WIRE_CHANNELD_GOT_ANNOUNCEMENT:
 	case WIRE_CHANNELD_GOT_SHUTDOWN:
 	case WIRE_CHANNELD_SHUTDOWN_COMPLETE:
@@ -2782,7 +2733,6 @@ static void req_in(struct eltoo_peer *peer, const u8 *msg)
 	case WIRE_CHANNELD_SEND_ERROR_REPLY:
 	case WIRE_CHANNELD_DEV_QUIESCE_REPLY:
 	case WIRE_CHANNELD_UPGRADED:
-	case WIRE_CHANNELD_USED_CHANNEL_UPDATE:
 	case WIRE_CHANNELD_LOCAL_CHANNEL_UPDATE:
 	case WIRE_CHANNELD_LOCAL_CHANNEL_ANNOUNCEMENT:
 	case WIRE_CHANNELD_LOCAL_PRIVATE_CHANNEL:
@@ -2798,6 +2748,23 @@ static void req_in(struct eltoo_peer *peer, const u8 *msg)
     case WIRE_CHANNELD_RESENDING_UPDATESIG:
     case WIRE_CHANNELD_RESENDING_UPDATESIG_REPLY:
     case WIRE_CHANNELD_INIT_ELTOO:
+	case WIRE_CHANNELD_GOT_SPLICE_LOCKED:
+	case WIRE_CHANNELD_SPLICE_INIT:
+	case WIRE_CHANNELD_SPLICE_UPDATE:
+	case WIRE_CHANNELD_SPLICE_SIGNED:
+	case WIRE_CHANNELD_SPLICE_CONFIRMED_INIT:
+	case WIRE_CHANNELD_SPLICE_CONFIRMED_SIGNED:
+	case WIRE_CHANNELD_SPLICE_SENDING_SIGS:
+	case WIRE_CHANNELD_SPLICE_CONFIRMED_UPDATE:
+	case WIRE_CHANNELD_SPLICE_LOOKUP_TX:
+	case WIRE_CHANNELD_SPLICE_LOOKUP_TX_RESULT:
+	case WIRE_CHANNELD_SPLICE_FEERATE_ERROR:
+	case WIRE_CHANNELD_SPLICE_FUNDING_ERROR:
+	case WIRE_CHANNELD_SPLICE_STATE_ERROR:
+	case WIRE_CHANNELD_LOCAL_ANCHOR_INFO:
+	case WIRE_CHANNELD_ADD_INFLIGHT:
+	case WIRE_CHANNELD_UPDATE_INFLIGHT:
+	case WIRE_CHANNELD_GOT_INFLIGHT:
 		break;
 	}
 	master_badmsg(-1, msg);
@@ -2831,9 +2798,7 @@ static void init_channel(struct eltoo_peer *peer)
 	bool dev_fast_gossip;
 	struct bitcoin_tx *complete_update_tx, *complete_settle_tx;
 	struct bitcoin_tx *committed_update_tx, *committed_settle_tx;
-#if !DEVELOPER
 	bool dev_fail_process_onionpacket; /* Ignored */
-#endif
 
 	assert(!(fcntl(MASTER_FD, F_GETFL) & O_NONBLOCK));
 
@@ -2916,10 +2881,8 @@ static void init_channel(struct eltoo_peer *peer)
 	peer->final_index = tal_dup(peer, u32, &final_index);
 	peer->final_ext_key = tal_dup(peer, struct ext_key, &final_ext_key);
 
-#if DEVELOPER
 	peer->dev_disable_commit = dev_disable_commit;
 	peer->dev_fast_gossip = dev_fast_gossip;
-#endif
 
 	/* stdin == requests, 3 == peer */
 	peer->pps = new_per_peer_state(peer);
@@ -3043,12 +3006,10 @@ int main(int argc, char *argv[])
 	peer->last_update_timestamp = 0;
 	peer->last_empty_commitment = 0;
 	peer->sent_uncommitted_removals = false;
-#if EXPERIMENTAL_FEATURES
-	peer->stfu = false;
+	peer->want_stfu = false;
 	peer->stfu_sent[LOCAL] = peer->stfu_sent[REMOTE] = false;
 	peer->update_queue = msg_queue_new(peer, false);
 	/* peer->our_turn is decided in init_channel */
-#endif
 
 	/* We send these to HSM to get real signatures; don't have valgrind
 	 * complain. */
@@ -3096,7 +3057,7 @@ int main(int argc, char *argv[])
 		}
 
         /* And one at a time from peers */
-        if (!peer->stfu && is_our_turn(peer)
+        if (!peer->want_stfu && is_our_turn(peer)
             && (msg = msg_dequeue(peer->update_queue))) {
             status_debug("Now dealing with deferred update %s",
                      channeld_wire_name(

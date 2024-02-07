@@ -376,18 +376,13 @@ u8 *scriptpubkey_p2tr(const tal_t *ctx, const struct pubkey *inner_pubkey)
 
 	add_op(&script, OP_1);
 
-	secp256k1_ec_pubkey_serialize(secp256k1_ctx, key_bytes, &out_len,
-				      &inner_pubkey->pubkey,
-				      SECP256K1_EC_COMPRESSED);
+	secp256k1_ec_pubkey_serialize(secp256k1_ctx, key_bytes, &out_len, &inner_pubkey->pubkey, SECP256K1_EC_COMPRESSED);
 	/* Only commit to inner pubkey in tweak */
-	if (wally_ec_public_key_bip341_tweak(
-		key_bytes, 33, /* merkle_root*/ NULL, 0, 0 /* flags */,
-		tweaked_key_bytes, sizeof(tweaked_key_bytes)) != WALLY_OK)
+	if (wally_ec_public_key_bip341_tweak(key_bytes, 33, /* merkle_root*/ NULL, 0, 0 /* flags */, tweaked_key_bytes, sizeof(tweaked_key_bytes)) != WALLY_OK)
 		abort();
 
 	/* Cut off the first byte from the serialized compressed key */
-	script_push_bytes(&script, tweaked_key_bytes + 1,
-			  sizeof(tweaked_key_bytes) - 1);
+	script_push_bytes(&script, tweaked_key_bytes + 1, sizeof(tweaked_key_bytes) - 1);
 	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2TR_LEN);
 	return script;
 }
@@ -411,31 +406,6 @@ int pubkey_parity(const struct pubkey *pubkey)
 	assert(ok);
 
 	return pk_parity;
-}
-
-/* Create an output script for a taproot output */
-u8 *scriptpubkey_p2tr(const tal_t *ctx, const struct pubkey *pubkey)
-{
-	int ok;
-	secp256k1_xonly_pubkey x_key;
-	unsigned char x_key_bytes[32];
-	// struct sha256 h;
-	u8 *script = tal_arr(ctx, u8, 0);
-
-	add_op(&script, OP_1);
-
-	ok = secp256k1_xonly_pubkey_from_pubkey(secp256k1_ctx, &x_key,
-						/* pk_parity */ NULL,
-						&(pubkey->pubkey));
-	assert(ok);
-
-	ok = secp256k1_xonly_pubkey_serialize(secp256k1_ctx, x_key_bytes,
-					      &x_key);
-	assert(ok);
-
-	script_push_bytes(&script, x_key_bytes, sizeof(x_key_bytes));
-	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2TR_LEN);
-	return script;
 }
 
 /* BOLT #3:
@@ -1328,12 +1298,18 @@ u8 *make_eltoo_settle_script(const tal_t *ctx,
 	struct privkey g;
 	unsigned char one_G_bytes[33];
 
-	/* We use tapleaf_script as a switch for doing BIP342 hash
-	 * We really shouldn't, but for now we pass in dummy
-	 * since APOAS sighash doesn't cover it anyways.
-	 */
-	bitcoin_tx_taproot_hash_for_sig(settle_tx, input_index, sh_type, script,
-					/* annex */ NULL, &sighash);
+    /* We use tapleaf_script as a switch for doing BIP342 hash
+     * We really shouldn't, but for now we pass in dummy
+     * since APOAS sighash doesn't cover it anyways.
+     */
+    bitcoin_tx_taproot_hash_for_sig(settle_tx,
+                 input_index,
+                 sh_type,
+                 script,
+                 /* annex */ NULL,
+                 &sighash);
+
+	assert(ok);
 
 	/* Should directly take keypair instead of extracting but... */
 	create_keypair_of_one(&G_pair);

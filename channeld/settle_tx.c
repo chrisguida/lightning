@@ -21,7 +21,10 @@ static bool trim(const struct htlc *htlc,
 {
 	return htlc_is_trimmed(htlc_owner(htlc), htlc->amount,
 			       /* feerate_per_kw */ 0, dust_limit, /* side */ LOCAL,
-			       /* option_anchor_outputs */ true);
+			       /* option_anchor_outputs */ false,
+				   /* option_anchors_zero_fee_htlc_tx */ false,
+				   /* option_commit_zero_fees */ true
+				   );
 }
 
 size_t settle_tx_num_untrimmed(const struct htlc **htlcs,
@@ -124,6 +127,7 @@ struct bitcoin_tx *settle_tx(const tal_t *ctx,
 {
     printf("SELF PAY: %lu, OTHER PAY: %lu\n", self_pay.millisatoshis, other_pay.millisatoshis);
 	struct amount_msat total_pay;
+	struct amount_msat trimmed_value;
 	struct bitcoin_tx *tx;
 	size_t i, n, num_untrimmed;
 	u32 *cltvs;
@@ -156,6 +160,7 @@ struct bitcoin_tx *settle_tx(const tal_t *ctx,
            funding_pubkey_ptrs,
            /* n_pubkeys */ 2);
 
+	trimmed_value.millisatoshis = 0;
 
 	if (!amount_msat_add(&total_pay, self_pay, other_pay))
 		abort();
@@ -171,7 +176,7 @@ struct bitcoin_tx *settle_tx(const tal_t *ctx,
 
 
 	/* Worst-case sizing: both to-local and to-remote outputs, and single anchor. */
-	tx = bitcoin_tx(ctx, chainparams, 1, num_untrimmed + NUM_SIDES + 1, 0);
+	tx = bitcoin_tx(ctx, chainparams, 1, num_untrimmed + NUM_SIDES + 1, 0, 3);
 
 	/* We keep track of which outputs have which HTLCs */
 	*htlcmap = tal_arr(tx, const struct htlc *, tx->wtx->outputs_allocation_len);
@@ -190,8 +195,10 @@ struct bitcoin_tx *settle_tx(const tal_t *ctx,
 	 *    [HTLC output](#htlc-outputs).
 	 */
 	for (i = 0; i < tal_count(htlcs); i++) {
-		if (trim(htlcs[i], dust_limit))
+		if (trim(htlcs[i], dust_limit)) {
+			if (!amount_msat_add(&trimmed_value, trimmed_value, htlcs[i]->amount)) return false;
 			continue;
+        }
 		add_eltoo_htlc_out(tx, htlcs[i], eltoo_keyset,
 				     htlc_owner(htlcs[i]));
 		(*htlcmap)[n] = htlcs[i];
@@ -212,8 +219,10 @@ struct bitcoin_tx *settle_tx(const tal_t *ctx,
 		(*htlcmap)[n] = direct_outputs ? dummy_to_local : NULL;
 		n++;
 		to_local = true;
-	} else
-		to_local = false;
+	} else {
+        if (!amount_msat_add(&trimmed_value, trimmed_value, other_pay)) return false;
+		to_remote = false;
+	}
 
 	/* BOLT #3:
 	 *
@@ -229,11 +238,12 @@ struct bitcoin_tx *settle_tx(const tal_t *ctx,
 
 		to_remote = true;
 	} else {
+		if (!amount_msat_add(&trimmed_value, trimmed_value, other_pay)) return false;
 		to_remote = false;
 	}
 
     if (to_local || to_remote || num_untrimmed != 0) {
-        tx_add_ephemeral_anchor_output(tx);
+        tx_add_ephemeral_anchor_output(tx, amount_msat_to_sat_round_down(trimmed_value));
         (*htlcmap)[n] = NULL;
         n++;
     }
@@ -276,7 +286,7 @@ struct bitcoin_tx *settle_tx(const tal_t *ctx,
 	/* Identify the direct outputs (to_us, to_them). */
 	if (direct_outputs != NULL) {
 		direct_outputs[LOCAL] = direct_outputs[REMOTE] = NULL;
-		for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
+		for (i = 0; i < tx->wtx->num_outputs; i++) {
 			if ((*htlcmap)[i] == dummy_to_local) {
 				(*htlcmap)[i] = NULL;
 				direct_outputs[LOCAL] = tx->wtx->outputs + i;

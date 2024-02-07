@@ -171,6 +171,7 @@ void bipmusig_finalize_keys(struct pubkey *agg_pk,
 void bipmusig_gen_nonce(secp256k1_musig_secnonce *secnonce,
 			secp256k1_musig_pubnonce *pubnonce,
 			const struct privkey *privkey,
+			const struct pubkey *pubkey,
 			secp256k1_musig_keyagg_cache *keyagg_cache,
 			const unsigned char *msg32);
 

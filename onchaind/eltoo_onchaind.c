@@ -22,7 +22,7 @@
 #include <unistd.h>
 #include <wally_bip32.h>
 #include <wire/wire_sync.h>
-#include "onchain_types_names_gen.h"
+  #include "onchain_types_names_gen.h"
 
 /* stdin == requests */
 #define REQ_FD STDIN_FILENO
@@ -38,7 +38,7 @@ static bool bipmusig_partial_sigs_combine_state(const struct eltoo_sign *state,
     p_sigs[0] = &state->self_psig.p_sig;
     p_sigs[1] = &state->other_psig.p_sig;
     return bipmusig_partial_sigs_combine(p_sigs, 2 /* num_signers */, &state->session.session, sig);
-}  
+}
 
 /* Used as one-way latch to detect when the state ordering is being settled */
 static bool update_phase;
@@ -196,7 +196,7 @@ static struct bitcoin_tx *bip340_tx_to_us(const tal_t *ctx,
 		type_to_string(NULL, struct pubkey,
                     &keyset->inner_pubkey));
 
-    tx = bitcoin_tx(ctx, chainparams, 1, 1, locktime);
+    tx = bitcoin_tx(ctx, chainparams, 1, 1, locktime, 2);
     bitcoin_tx_add_input(tx, &out->outpoint, 0 /* sequence */,
             NULL /* scriptSig */, out->sat, out->scriptPubKey /* scriptPubkey */,
             NULL /* input_wscript */, NULL /* inner_pubkey */, NULL /* tap_tree */);
@@ -234,7 +234,7 @@ static struct bitcoin_tx *bip340_tx_to_us(const tal_t *ctx,
 
     if (amount_sat_less(out->sat, min_out)) {
         /* FIXME: We should use SIGHASH_NONE so others can take it */
-        fee = amount_tx_fee(feerate_floor(), max_weight);
+        fee = amount_tx_fee(feerate_floor_check(), max_weight);
         status_unusual("TX %s amount %s too small to"
                    " pay reasonable fee, using minimal fee"
                    " and ignoring",
@@ -243,7 +243,7 @@ static struct bitcoin_tx *bip340_tx_to_us(const tal_t *ctx,
         *tx_type = IGNORING_TINY_PAYMENT;
     }
 
-    /* This can only happen if feerate_floor() is still too high; shouldn't
+    /* This can only happen if feerate_floor_check() is still too high; shouldn't
      * happen! */
     if (!amount_sat_sub(&amt, out->sat, fee)) {
         amt = dust_limit;
@@ -479,59 +479,6 @@ static bool eltoo_proposal_is_rbfable(const struct proposed_resolution *proposal
             proposal->tx_type == ELTOO_SETTLE ||
             proposal->tx_type == ELTOO_HTLC_SUCCESS ||
             proposal->tx_type == ELTOO_HTLC_TIMEOUT;
-}
-
-/** proposal_should_rbf
- *
- * @brief the given output just increased its depth,
- * so the proposal for it should be RBFed and
- * rebroadcast.
- *
- * @desc precondition: the given output must have an
- * rbfable proposal as per `eltoo_proposal_is_rbfable`.
- */
-static void eltoo_proposal_should_rbf(struct tracked_output *out)
-{
-	struct bitcoin_tx *tx = NULL;
-	u32 depth;
-
-	assert(out->proposal);
-	assert(eltoo_proposal_is_rbfable(out->proposal));
-
-	depth = out->depth;
-
-	/* Do not RBF at depth 1.
-	 *
-	 * Since we react to *onchain* events, whatever proposal we made,
-	 * the output for that proposal is already at depth 1.
-	 *
-	 * Since our initial proposal was broadcasted with the output at
-	 * depth 1, we should not RBF until a new block arrives, which is
-	 * at depth 2.
-	 */
-	if (depth <= 1)
-		return;
-
-	/* Add other RBF-able proposals here.  */
-
-	/* Broadcast the transaction.  */
-	if (tx) {
-		enum wallet_tx_type wtt;
-
-		status_debug("Broadcasting RBF %s (%s) to resolve %s/%s "
-			     "depth=%"PRIu32"",
-			     eltoo_tx_type_name(out->proposal->tx_type),
-			     type_to_string(tmpctx, struct bitcoin_tx, tx),
-			     eltoo_tx_type_name(out->tx_type),
-			     output_type_name(out->output_type),
-			     depth);
-
-		wtt = onchain_txtype_to_wallet_txtype(out->proposal->tx_type);
-		wire_sync_write(REQ_FD,
-				take(towire_onchaind_broadcast_tx(NULL, tx,
-								 wtt,
-								 true)));
-	}
 }
 
 static void eltoo_proposal_meets_depth(struct tracked_output *out)
@@ -1250,16 +1197,16 @@ static void eltoo_tx_new_depth(struct tracked_output **outs,
     /* FIXME re-add note_missing_htlcs for TRIMMED ONLY here... should this b
      * done immediately, not at "reasonable depth"?
      */
-    if (bitcoin_txid_eq(&outs[0]->resolved->txid, txid)
-        && depth >= reasonable_depth
-        && missing_htlc_msgs) {
-        status_debug("Sending %zu missing htlc messages",
-                 tal_count(missing_htlc_msgs));
-        for (i = 0; i < tal_count(missing_htlc_msgs); i++)
-            wire_sync_write(REQ_FD, missing_htlc_msgs[i]);
-        /* Don't do it again. */
-        missing_htlc_msgs = tal_free(missing_htlc_msgs);
-    }
+	if (bitcoin_txid_eq(&outs[0]->resolved->txid, txid)
+	    && depth >= reasonable_depth
+	    && missing_htlc_msgs) {
+		status_debug("Sending %zu missing htlc messages",
+			     tal_count(missing_htlc_msgs));
+		for (i = 0; i < tal_count(missing_htlc_msgs); i++)
+			wire_sync_write(REQ_FD, missing_htlc_msgs[i]);
+		/* Don't do it again. */
+		missing_htlc_msgs = tal_free(missing_htlc_msgs);
+	}
 
 	for (i = 0; i < tal_count(outs); i++) {
 		/* Update output depth. */
@@ -1283,19 +1230,10 @@ static void eltoo_tx_new_depth(struct tracked_output **outs,
             && depth >= outs[i]->proposal->depth_required) {
 			eltoo_proposal_meets_depth(outs[i]);
 		}
-
-		/* Otherwise, is this an output whose proposed resolution
-		 * we should RBF?  */
-		if (outs[i]->proposal
-		    && bitcoin_txid_eq(&outs[i]->outpoint.txid, txid)
-		    && eltoo_proposal_is_rbfable(outs[i]->proposal))
-			eltoo_proposal_should_rbf(outs[i]);
-
 	}
 }
 
 
-#if DEVELOPER
 static void memleak_remove_globals(struct htable *memtable, const tal_t *topctx)
 {
 	if (keyset)
@@ -1320,18 +1258,12 @@ static bool handle_dev_memleak(struct tracked_output **outs, const u8 *msg)
 	memleak_remove_globals(memtable, tal_parent(outs));
 	memleak_remove_region(memtable, outs, tal_bytelen(outs));
 
-	found_leak = dump_memleak(memtable, memleak_status_broken);
+	found_leak = dump_memleak(memtable, memleak_status_broken, NULL);
 	wire_sync_write(REQ_FD,
 			take(towire_onchaind_dev_memleak_reply(NULL,
 							      found_leak)));
 	return true;
 }
-#else
-static bool handle_dev_memleak(struct tracked_output **outs, const u8 *msg)
-{
-	return false;
-}
-#endif /* !DEVELOPER */
 
 static void wait_for_mutual_resolved(struct tracked_output **outs)
 {

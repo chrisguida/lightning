@@ -46,7 +46,7 @@ htlc_tx(const tal_t *ctx, const struct chainparams *chainparams,
 			      option_commit_zero_fee)
 				 ? 1
 				 : 0,
-			     NULL, amount, NULL, commit_wscript);
+			     NULL, amount, NULL, commit_wscript, NULL, NULL);
 
 	/* BOLT #3:
 	 * * txout count: 1

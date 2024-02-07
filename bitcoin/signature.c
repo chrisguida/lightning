@@ -159,24 +159,24 @@ void bipmusig_inner_pubkey(struct pubkey *inner_pubkey,
 	assert(n_pubkeys <= 100);
 
 	/* Sorting moves pubkeys themselves, we copy and discard after */
-	secp256k1_xonly_pubkey x_keys[100];
-	const secp256k1_xonly_pubkey *x_keys_ptr[100];
+	// secp256k1_xonly_pubkey x_keys[100];
+	const secp256k1_pubkey *keys_ptr[100];
 
 	for (i = 0; i < n_pubkeys; ++i) {
-		ok = secp256k1_xonly_pubkey_from_pubkey(
-		    secp256k1_ctx, &x_keys[i], /* pk_parity */ NULL,
-		    &(pubkeys[i]->pubkey));
-		assert(ok);
-		x_keys_ptr[i] = &x_keys[i];
+		// ok = secp256k1_xonly_pubkey_from_pubkey(
+		//     secp256k1_ctx, &x_keys[i], /* pk_parity */ NULL,
+		//     &(pubkeys[i]->pubkey));
+		// assert(ok);
+		keys_ptr[i] = &(pubkeys[i]->pubkey);
 	}
 
-	ok = secp256k1_xonly_sort(secp256k1_ctx, x_keys_ptr, n_pubkeys);
+	ok = secp256k1_pubkey_sort(secp256k1_ctx, keys_ptr, n_pubkeys);
 
 	assert(ok);
 
 	ok = secp256k1_musig_pubkey_agg(secp256k1_ctx, NULL /* scratch */,
 					NULL /* agg_pk */, keyagg_cache,
-					x_keys_ptr, n_pubkeys);
+					keys_ptr, n_pubkeys);
 
 	assert(ok);
 
@@ -200,23 +200,23 @@ void bipmusig_finalize_keys(struct pubkey *agg_pk,
 	assert(n_pubkeys <= 100);
 
 	/* Sorting moves pubkeys themselves, we copy and discard after */
-	secp256k1_xonly_pubkey x_keys[100];
-	const secp256k1_xonly_pubkey *x_keys_ptr[100];
+	// secp256k1_xonly_pubkey x_keys[100];
+	const secp256k1_pubkey *keys_ptr[100];
 
 	for (i = 0; i < n_pubkeys; ++i) {
-		ok = secp256k1_xonly_pubkey_from_pubkey(
-		    secp256k1_ctx, &x_keys[i], /* pk_parity */ NULL,
-		    &(pubkeys[i]->pubkey));
-		assert(ok);
-		x_keys_ptr[i] = &x_keys[i];
+		// ok = secp256k1_xonly_pubkey_from_pubkey(
+		//     secp256k1_ctx, &x_keys[i], /* pk_parity */ NULL,
+		//     &(pubkeys[i]->pubkey));
+		// assert(ok);
+		keys_ptr[i] = &(pubkeys[i]->pubkey);
 	}
 
-	ok = secp256k1_xonly_sort(secp256k1_ctx, x_keys_ptr, n_pubkeys);
+	ok = secp256k1_pubkey_sort(secp256k1_ctx, keys_ptr, n_pubkeys);
 
 	assert(ok);
 
 	ok = secp256k1_musig_pubkey_agg(secp256k1_ctx, NULL /* scratch */,
-					&agg_x_key, keyagg_cache, x_keys_ptr,
+					&agg_x_key, keyagg_cache, keys_ptr,
 					n_pubkeys);
 
 	assert(ok);
@@ -262,6 +262,7 @@ void bipmusig_finalize_keys(struct pubkey *agg_pk,
 void bipmusig_gen_nonce(secp256k1_musig_secnonce *secnonce,
 			secp256k1_musig_pubnonce *pubnonce,
 			const struct privkey *privkey,
+			const struct pubkey *pubkey,
 			secp256k1_musig_keyagg_cache *keyagg_cache,
 			const unsigned char *msg32)
 {
@@ -273,7 +274,9 @@ void bipmusig_gen_nonce(secp256k1_musig_secnonce *secnonce,
 	randombytes_buf(session_id, sizeof(session_id));
 
 	ok = secp256k1_musig_nonce_gen(secp256k1_ctx, secnonce, pubnonce,
-				       session_id, privkey->secret.data, msg32,
+				       session_id, privkey->secret.data,
+					   &pubkey->pubkey,
+					   msg32,
 				       keyagg_cache, NULL /* extra_input32 */);
 
 	assert(ok);
@@ -348,20 +351,9 @@ bool bipmusig_partial_sig_verify(const struct partial_sig *p_sig,
 				 const struct musig_keyagg_cache *keyagg_cache,
 				 struct musig_session *session)
 {
-	int ret;
-	secp256k1_xonly_pubkey xonly_inner_pubkey;
-
-	ret = secp256k1_xonly_pubkey_from_pubkey(
-	    secp256k1_ctx, &xonly_inner_pubkey, NULL /* pk_parity */,
-	    &signer_pk->pubkey);
-
-	if (!ret) {
-		return false;
-	}
-
 	return secp256k1_musig_partial_sig_verify(
 	    secp256k1_ctx, &p_sig->p_sig, &signer_nonce->nonce,
-	    &xonly_inner_pubkey, &keyagg_cache->cache, &session->session);
+	    &signer_pk->pubkey, &keyagg_cache->cache, &session->session);
 }
 
 bool bipmusig_partial_sigs_combine(
@@ -411,32 +403,39 @@ void bitcoin_tx_taproot_hash_for_sig(
     const unsigned char *tapleaf_script, /* FIXME Get directly from PSBT? */
     u8 *annex, struct sha256_double *dest)
 {
-	int ret, i;
+	int ret;
+	struct wally_map *scripts = NULL;
+	uint64_t *values = NULL;
 
 	/* Preparing args for taproot*/
 	size_t input_count = tx->wtx->num_inputs;
-	const unsigned char *input_spks[input_count];
-	size_t input_spk_lens[input_count];
-	u64 input_val_sats[input_count];
-
-	for (i = 0; i < input_count; ++i) {
-		input_spks[i] = psbt_input_get_scriptpubkey(tx->psbt, i);
-		input_spk_lens[i] =
-		    tal_bytelen(input_spks[i]); /* FIXME ??? tal_bytelen? */
-		input_val_sats[i] = psbt_input_get_amount(tx->psbt, i).satoshis;
-	}
 
 	/* Wally can allocate here, iff tx doesn't fit on stack */
 	tal_wally_start();
-	ret = wally_tx_get_btc_taproot_signature_hash(
-	    tx->wtx, sighash_type, input_index, input_spks, input_spk_lens,
-	    input_val_sats, tapleaf_script, tal_bytelen(tapleaf_script),
-	    (sighash_type & SIGHASH_ANYPREVOUTANYSCRIPT) ==
-		    SIGHASH_ANYPREVOUTANYSCRIPT
-		? 0x01
-		: 0x00 /* key_version */,
-	    0xFFFFFFFF /* codesep_position */, annex, tal_count(annex),
-	    0 /* flags */, dest->sha.u.u8, sizeof(*dest));
+
+    /* Taproot */
+    ret = wally_psbt_get_scripts_and_values(tx->psbt, scripts, &values);
+	assert(ret==WALLY_OK);
+
+    ret = wally_tx_get_btc_taproot_signature_hash(
+        tx->wtx, /* tx */
+		input_index, /* index */
+
+		scripts, /* scripts */
+		values, /* values */
+        input_count, /* num_values */
+
+		tapleaf_script, /* tapleaf_script */
+		tal_bytelen(tapleaf_script), /* tapleaf_script_len */
+		(sighash_type & SIGHASH_ANYPREVOUTANYSCRIPT) == SIGHASH_ANYPREVOUTANYSCRIPT ? 0x01 : 0x00 /* key_version */,
+        0xFFFFFFFF /* codesep_position */,
+		annex, /* annex */
+		tal_count(annex), /* annex_len */
+		sighash_type, /* sighash */
+		0 /* flags */,
+		dest->sha.u.u8, /* bytes_out */
+		sizeof(*dest) /* len */
+	);
 
 	assert(ret == WALLY_OK);
 	tal_wally_end(tx->wtx);

@@ -17,6 +17,9 @@ struct bitcoin_signature;
 struct bitcoin_txid;
 struct pubkey;
 
+int wally_psbt_get_scripts_and_values(const struct wally_psbt *psbt,
+    struct wally_map *scripts,
+    uint64_t **values);
 
 /* Utility we need for psbt stuffs;
  * add the varint onto the given array */

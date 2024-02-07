@@ -738,7 +738,7 @@ onchaind_tx_unsigned(const tal_t *ctx, struct channel *channel,
 
 	tx = bitcoin_tx(ctx, chainparams, 1, 1, info->locktime, 2);
 	bitcoin_tx_add_input(tx, &info->out, info->to_self_delay, NULL,
-			     info->out_sats, NULL, info->wscript);
+			     info->out_sats, NULL, info->wscript, NULL, NULL);
 
 	/* FIXME should this be p2tr now? */
 	bitcoin_tx_add_output(tx, scriptpubkey_p2wpkh(tmpctx, &final_key), NULL,

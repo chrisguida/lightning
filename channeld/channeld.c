@@ -260,7 +260,8 @@ static void maybe_send_stfu(struct peer *peer)
 	if (pending_updates(peer->channel, LOCAL, false)) {
 		status_info("Pending updates prevent us from STFU mode at this"
 			    " time.");
-	} else if (!peer->stfu_sent[LOCAL]) {
+	}
+	else if (!peer->stfu_sent[LOCAL]) {
 		status_debug("Sending peer that we want to STFU.");
 		u8 *msg = towire_stfu(NULL, &peer->channel_id,
 				      peer->stfu_initiator == LOCAL);
@@ -279,8 +280,7 @@ static void maybe_send_stfu(struct peer *peer)
 				towire_channeld_dev_quiesce_reply(tmpctx));
 
 		peer->stfu_wait_single_msg = true;
-		status_unusual(
-		    "STFU complete: setting stfu_wait_single_msg = true");
+		status_unusual("STFU complete: setting stfu_wait_single_msg = true");
 		if (peer->on_stfu_success) {
 			peer->on_stfu_success(peer);
 			peer->on_stfu_success = NULL;
