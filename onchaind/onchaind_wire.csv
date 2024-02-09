@@ -248,3 +248,54 @@ msgdata,eltoo_onchaind_new_state_output,new_prevout,bitcoin_outpoint,
 msgdata,eltoo_onchaind_new_state_output,invalidated_update_num,u32,
 msgdata,eltoo_onchaind_new_state_output,annex_hint_len,u16,
 msgdata,eltoo_onchaind_new_state_output,invalidated_annex_hint,u8,annex_hint_len
+
+# We tell lightningd to create sign and broadcast this
+# eltoo htlc resolution tx:
+msgtype,eltoo_onchaind_spend_to_us,5162
+msgdata,eltoo_onchaind_spend_to_us,outpoint,bitcoin_outpoint,
+msgdata,eltoo_onchaind_spend_to_us,outpoint_amount,amount_sat,
+msgdata,eltoo_onchaind_spend_to_us,wscript_len,u32,
+msgdata,eltoo_onchaind_spend_to_us,wscript,u8,wscript_len
+
+# We tell lightningd to create sign and broadcast this
+# eltoo update tx:
+msgtype,eltoo_onchaind_update,5262
+#msgdata,eltoo_onchaind_update,outpoint,bitcoin_outpoint,
+#msgdata,eltoo_onchaind_update,outpoint_amount,amount_sat,
+#msgdata,eltoo_onchaind_update,wscript_len,u32,
+#msgdata,eltoo_onchaind_update,wscript,u8,wscript_len
+
+# We tell lightningd to create sign and broadcast this
+# eltoo settlement tx:
+#msgtype,eltoo_onchaind_settlement,5362
+#msgdata,eltoo_onchaind_settlement,outpoint,bitcoin_outpoint,
+#msgdata,eltoo_onchaind_settlement,outpoint_amount,amount_sat,
+#msgdata,eltoo_onchaind_settlement,wscript_len,u32,
+#msgdata,eltoo_onchaind_settlement,wscript,u8,wscript_len
+
+# onchaind->master: Send out an update tx.
+# If is_rbf is false then master should rebroadcast the tx.
+# If is_rbf is true then onchaind is responsible for rebroadcasting
+#  it with a higher fee.
+msgtype,eltoo_onchaind_update,5013
+msgdata,eltoo_onchaind_update,tx,bitcoin_tx,
+msgdata,eltoo_onchaind_update,type,enum wallet_tx_type,
+msgdata,eltoo_onchaind_update,is_rbf,bool,
+
+# onchaind->master: Send out a settlement tx.
+# If is_rbf is false then master should rebroadcast the tx.
+# If is_rbf is true then onchaind is responsible for rebroadcasting
+#  it with a higher fee.
+msgtype,eltoo_onchaind_settlement,5014
+msgdata,eltoo_onchaind_settlement,tx,bitcoin_tx,
+msgdata,eltoo_onchaind_settlement,type,enum wallet_tx_type,
+msgdata,eltoo_onchaind_settlement,is_rbf,bool,
+
+# onchaind->master: Send out an htlc resolution tx.
+# If is_rbf is false then master should rebroadcast the tx.
+# If is_rbf is true then onchaind is responsible for rebroadcasting
+#  it with a higher fee.
+msgtype,eltoo_onchaind_htlc_resolution_tx,5015
+msgdata,eltoo_onchaind_htlc_resolution_tx,tx,bitcoin_tx,
+msgdata,eltoo_onchaind_htlc_resolution_tx,type,enum wallet_tx_type,
+msgdata,eltoo_onchaind_htlc_resolution_tx,is_rbf,bool,

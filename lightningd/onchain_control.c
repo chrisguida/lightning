@@ -670,6 +670,23 @@ static u8 *sign_htlc_expired(const tal_t *ctx, const struct bitcoin_tx *tx,
 	    info->channel->dbid);
 }
 
+static u8 *sign_eltoo_htlc_timeout(const tal_t *ctx,
+                 struct bitcoin_tx *tx,
+                 const u8 *tapscript)
+{
+    return towire_hsmd_sign_eltoo_htlc_timeout_tx(ctx,
+                             tx, tapscript);
+}
+
+static u8 *sign_eltoo_htlc_success(const tal_t *ctx,
+                 struct bitcoin_tx *tx,
+                 const u8 *tapscript)
+{
+    return towire_hsmd_sign_eltoo_htlc_success_tx(ctx,
+                             tx, tapscript);
+}
+
+
 /* Matches bitcoin_witness_sig_and_element! */
 static const struct onchain_witness_element **
 onchain_witness_sig_and_element(const tal_t *ctx, u8 **witness)
@@ -1163,6 +1180,54 @@ static void handle_onchaind_spend_to_us(struct channel *channel, const u8 *msg)
 			  sign_tx_to_us, info, __func__);
 }
 
+static void handle_eltoo_onchaind_spend_to_us(struct channel *channel, const u8 *msg)
+{
+	struct onchain_signing_info *info;
+	struct bitcoin_outpoint out;
+	struct amount_sat out_sats;
+
+	info = new_signing_info(msg, channel, WIRE_ELTOO_ONCHAIND_SPEND_TO_US);
+
+	/* BOLT #3:
+	 * #### `to_local` Output
+	 *...
+	 * The output is spent by an input with `nSequence` field set to
+	 *`to_self_delay` (which can only be valid after that duration has
+	 *passed) and witness:
+	 *
+	 *    <local_delayedsig> <>
+	 */
+
+	/* BOLT #3:
+	 * ## HTLC-Timeout and HTLC-Success Transactions
+	 *
+	 * These HTLC transactions are almost identical, except the HTLC-timeout
+	 *transaction is timelocked.
+	 *...
+	 * To spend this via penalty, the remote node uses a witness stack
+	 * `<revocationsig> 1`, and to collect the output, the local node uses
+	 * an input with nSequence `to_self_delay` and a witness stack
+	 * `<local_delayedsig> 0`.
+	 */
+	info->stack_elem = NULL;
+
+	if (!fromwire_onchaind_spend_to_us(
+		info, msg, &out, &out_sats, &info->minblock,
+		&info->u.htlc_timedout.commit_num, &info->wscript)) {
+		channel_internal_error(channel,
+				       "Invalid onchaind_spend_to_us %s",
+				       tal_hex(tmpctx, msg));
+		return;
+	}
+
+	/* No real deadline on this, it's just returning to our wallet. */
+	info->deadline_block =
+	    infinite_block_deadline(channel->peer->ld->topology);
+	create_onchain_tx(channel, &out, out_sats,
+			  channel->channel_info.their_config.to_self_delay, 0,
+			  sign_tx_to_us, info, __func__);
+}
+
 static void handle_onchaind_spend_penalty(struct channel *channel,
 					  const u8 *msg)
 {
@@ -1395,6 +1460,94 @@ static void handle_onchaind_spend_htlc_timeout(struct channel *channel,
 	subd_send_msg(channel->owner, take(msg));
 }
 
+// static void handle_eltoo_onchaind_spend_htlc_timeout(struct channel *channel,
+// 					       const u8 *msg)
+// {
+// 	struct onchain_signing_info *info;
+// 	struct bitcoin_outpoint out;
+// 	struct amount_sat out_sats;
+// 	u64 htlc_id;
+// 	u32 cltv_expiry;
+// 	const bool anchor_outputs = channel_type_has_anchors(channel->type);
+
+// 	info = new_signing_info(msg, channel, WIRE_ONCHAIND_SPEND_HTLC_EXPIRED);
+
+// 	/* BOLT #5:
+// 	 *
+// 	 * ## HTLC Output Handling: Remote Commitment, Local Offers
+// 	 * ...
+// 	 *
+// 	 *   - if the commitment transaction HTLC output has *timed out* AND NOT
+// 	 *     been *resolved*:
+// 	 *     - MUST *resolve* the output, by spending it to a convenient
+// 	 *       address.
+// 	 */
+// 	info->stack_elem = NULL;
+
+// 	if (!fromwire_onchaind_spend_htlc_expired(
+// 		info, msg, &out, &out_sats, &htlc_id, &cltv_expiry,
+// 		&info->u.htlc_expired.remote_per_commitment_point,
+// 		&info->wscript)) {
+// 		channel_internal_error(channel,
+// 				       "Invalid onchaind_spend_htlc_expired %s",
+// 				       tal_hex(tmpctx, msg));
+// 		return;
+// 	}
+
+// 	/* nLocktime: we have to be *after* that block! */
+// 	info->minblock = cltv_expiry + 1;
+
+// 	/* We have to spend it before we can close incoming */
+// 	info->deadline_block =
+// 	    htlc_outgoing_incoming_deadline(channel, htlc_id);
+// 	create_onchain_tx(channel, &out, out_sats, anchor_outputs ? 1 : 0,
+// 			  cltv_expiry, sign_htlc_expired, info, __func__);
+// }
+
+// static void handle_onchaind_spend_eltoo_htlc_success(struct channel *channel,
+// 					       const u8 *msg)
+// {
+// 	struct onchain_signing_info *info;
+// 	struct bitcoin_outpoint out;
+// 	struct amount_sat out_sats;
+// 	u64 htlc_id;
+// 	u32 cltv_expiry;
+// 	const bool anchor_outputs = channel_type_has_anchors(channel->type);
+
+// 	info = new_signing_info(msg, channel, WIRE_ONCHAIND_SPEND_HTLC_EXPIRED);
+
+// 	/* BOLT #5:
+// 	 *
+// 	 * ## HTLC Output Handling: Remote Commitment, Local Offers
+// 	 * ...
+// 	 *
+// 	 *   - if the commitment transaction HTLC output has *timed out* AND NOT
+// 	 *     been *resolved*:
+// 	 *     - MUST *resolve* the output, by spending it to a convenient
+// 	 *       address.
+// 	 */
+// 	info->stack_elem = NULL;
+
+// 	if (!fromwire_onchaind_spend_htlc_expired(
+// 		info, msg, &out, &out_sats, &htlc_id, &cltv_expiry,
+// 		&info->u.htlc_expired.remote_per_commitment_point,
+// 		&info->wscript)) {
+// 		channel_internal_error(channel,
+// 				       "Invalid onchaind_spend_htlc_expired %s",
+// 				       tal_hex(tmpctx, msg));
+// 		return;
+// 	}
+
+// 	/* nLocktime: we have to be *after* that block! */
+// 	info->minblock = cltv_expiry + 1;
+
+// 	/* We have to spend it before we can close incoming */
+// 	info->deadline_block =
+// 	    htlc_outgoing_incoming_deadline(channel, htlc_id);
+// 	create_onchain_tx(channel, &out, out_sats, anchor_outputs ? 1 : 0,
+// 			  cltv_expiry, sign_htlc_expired, info, __func__);
+// }
+
 static void handle_onchaind_spend_htlc_expired(struct channel *channel,
 					       const u8 *msg)
 {
@@ -1449,6 +1602,10 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg,
 		handle_onchain_init_reply(sd->channel, msg);
 		break;
 
+	case WIRE_ELTOO_ONCHAIND_INIT_REPLY:
+		handle_eltoo_onchain_init_reply(sd->channel, msg);
+		break;
+
 	case WIRE_ONCHAIND_UNWATCH_TX:
 		handle_onchain_unwatch_tx(sd->channel, msg);
 		break;
@@ -1489,6 +1646,10 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg,
 		handle_onchaind_spend_to_us(sd->channel, msg);
 		break;
 
+	case WIRE_ELTOO_ONCHAIND_SPEND_TO_US:
+		handle_eltoo_onchaind_spend_to_us(sd->channel, msg);
+		break;
+
 	case WIRE_ONCHAIND_SPEND_PENALTY:
 		handle_onchaind_spend_penalty(sd->channel, msg);
 		break;
@@ -1521,7 +1682,7 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg,
 		break;
 	/* These are illegal */
 	case WIRE_ELTOO_ONCHAIND_INIT:
-	case WIRE_ELTOO_ONCHAIND_INIT_REPLY:
+	// case WIRE_ELTOO_ONCHAIND_INIT_REPLY:
 	case WIRE_ELTOO_ONCHAIND_NEW_STATE_OUTPUT:
 		abort();
 	}
@@ -1529,67 +1690,67 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg,
 	return 0;
 }
 
-/* FIXME if init is the only difference let's de-duplicate */
-static unsigned int eltoo_onchain_msg(struct subd *sd, const u8 *msg,
-				      const int *fds UNUSED)
-{
-	enum onchaind_wire t = fromwire_peektype(msg);
+// /* FIXME if init is the only difference let's de-duplicate */
+// static unsigned int eltoo_onchain_msg(struct subd *sd, const u8 *msg,
+// 				      const int *fds UNUSED)
+// {
+// 	enum onchaind_wire t = fromwire_peektype(msg);
 
-	switch (t) {
-		/* Only things changed... */
-	case WIRE_ELTOO_ONCHAIND_INIT_REPLY:
-		handle_eltoo_onchain_init_reply(sd->channel, msg);
-		break;
-		/* End Eltoo-related changes */
-	case WIRE_ONCHAIND_ALL_IRREVOCABLY_RESOLVED:
-		handle_irrevocably_resolved(sd->channel, msg);
-		break;
-	case WIRE_ONCHAIND_NOTIFY_COIN_MVT:
-		handle_onchain_log_coin_move(sd->channel, msg);
-		break;
-	case WIRE_ONCHAIND_BROADCAST_TX:
-		handle_onchain_broadcast_tx(sd->channel, msg);
-		break;
-	case WIRE_ONCHAIND_UNWATCH_TX:
-		handle_onchain_unwatch_tx(sd->channel, msg);
-		break;
-	case WIRE_ONCHAIND_ANNOTATE_TXIN:
-		onchain_annotate_txin(sd->channel, msg);
-		break;
-	case WIRE_ONCHAIND_ANNOTATE_TXOUT:
-		onchain_annotate_txout(sd->channel, msg);
-		break;
-	case WIRE_ELTOO_ONCHAIND_NEW_STATE_OUTPUT:
-		handle_new_state_output(sd->channel, msg);
-		break;
-	case WIRE_ONCHAIND_HTLC_TIMEOUT:
-		/* FIXME what needs to change for handling? */
-		handle_onchain_htlc_timeout(sd->channel, msg);
-		break;
-	case WIRE_ONCHAIND_EXTRACTED_PREIMAGE:
-		handle_extracted_preimage(sd->channel, msg);
-		break;
-	case WIRE_ONCHAIND_MISSING_HTLC_OUTPUT:
-	case WIRE_ONCHAIND_ADD_UTXO:
-		/* FIXME implement */
-		abort();
-	/* We send these, not receive them */
-	case WIRE_ONCHAIND_INIT:
-	case WIRE_ONCHAIND_SPENT:
-	case WIRE_ONCHAIND_DEPTH:
-	case WIRE_ONCHAIND_HTLCS:
-	case WIRE_ONCHAIND_KNOWN_PREIMAGE:
-	case WIRE_ONCHAIND_DEV_MEMLEAK:
-	case WIRE_ONCHAIND_DEV_MEMLEAK_REPLY:
-	case WIRE_ELTOO_ONCHAIND_INIT:
-		break;
-	/* These are illegal */
-	case WIRE_ONCHAIND_INIT_REPLY:
-		abort();
-	}
+// 	switch (t) {
+// 		/* Only things changed... */
+// 	case WIRE_ELTOO_ONCHAIND_INIT_REPLY:
+// 		handle_eltoo_onchain_init_reply(sd->channel, msg);
+// 		break;
+// 		/* End Eltoo-related changes */
+// 	case WIRE_ONCHAIND_ALL_IRREVOCABLY_RESOLVED:
+// 		handle_irrevocably_resolved(sd->channel, msg);
+// 		break;
+// 	case WIRE_ONCHAIND_NOTIFY_COIN_MVT:
+// 		handle_onchain_log_coin_move(sd->channel, msg);
+// 		break;
+// 	case WIRE_ONCHAIND_BROADCAST_TX:
+// 		handle_onchain_broadcast_tx(sd->channel, msg);
+// 		break;
+// 	case WIRE_ONCHAIND_UNWATCH_TX:
+// 		handle_onchain_unwatch_tx(sd->channel, msg);
+// 		break;
+// 	case WIRE_ONCHAIND_ANNOTATE_TXIN:
+// 		onchain_annotate_txin(sd->channel, msg);
+// 		break;
+// 	case WIRE_ONCHAIND_ANNOTATE_TXOUT:
+// 		onchain_annotate_txout(sd->channel, msg);
+// 		break;
+// 	case WIRE_ELTOO_ONCHAIND_NEW_STATE_OUTPUT:
+// 		handle_new_state_output(sd->channel, msg);
+// 		break;
+// 	case WIRE_ONCHAIND_HTLC_TIMEOUT:
+// 		/* FIXME what needs to change for handling? */
+// 		handle_onchain_htlc_timeout(sd->channel, msg);
+// 		break;
+// 	case WIRE_ONCHAIND_EXTRACTED_PREIMAGE:
+// 		handle_extracted_preimage(sd->channel, msg);
+// 		break;
+// 	case WIRE_ONCHAIND_MISSING_HTLC_OUTPUT:
+// 	case WIRE_ONCHAIND_ADD_UTXO:
+// 		/* FIXME implement */
+// 		abort();
+// 	/* We send these, not receive them */
+// 	case WIRE_ONCHAIND_INIT:
+// 	case WIRE_ONCHAIND_SPENT:
+// 	case WIRE_ONCHAIND_DEPTH:
+// 	case WIRE_ONCHAIND_HTLCS:
+// 	case WIRE_ONCHAIND_KNOWN_PREIMAGE:
+// 	case WIRE_ONCHAIND_DEV_MEMLEAK:
+// 	case WIRE_ONCHAIND_DEV_MEMLEAK_REPLY:
+// 	case WIRE_ELTOO_ONCHAIND_INIT:
+// 		break;
+// 	/* These are illegal */
+// 	case WIRE_ONCHAIND_INIT_REPLY:
+// 		abort();
+// 	}
 
-	return 0;
-}
+// 	return 0;
+// }
 
 /* Only error onchaind can get is if it dies. */
 static void onchain_error(struct channel *channel, struct peer_fd *pps UNUSED,
@@ -1753,15 +1914,15 @@ enum watch_result eltoo_onchaind_funding_spent(struct channel *channel,
 			  "Onchain funding spend");
 
 	hsmfd = hsm_get_client_fd(ld, &channel->peer->id, channel->dbid,
-				  HSM_CAP_SIGN_ONCHAIN_TX |
-				      HSM_CAP_COMMITMENT_POINT);
+				  HSM_PERM_SIGN_ONCHAIN_TX |
+				      HSM_PERM_COMMITMENT_POINT);
 
 	channel_set_owner(
 	    channel,
 	    new_channel_subd(channel, ld, "lightning_eltoo_onchaind", channel,
 			     &channel->peer->id, channel->log, false,
 			     onchaind_wire_name, /* N.B. Reusing onchaind */
-			     eltoo_onchain_msg, onchain_error,
+			     onchain_msg, onchain_error,
 			     channel_set_billboard, take(&hsmfd), NULL));
 
 	if (!channel->owner) {

@@ -2,6 +2,7 @@
 #include <bitcoin/feerate.h>
 #include <bitcoin/script.h>
 #include <ccan/asort/asort.h>
+#include <ccan/cast/cast.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/htlc_tx.h>
@@ -68,14 +69,28 @@ static u32 reasonable_depth;
 static u8 **missing_htlc_msgs;
 
 /* The messages which were sent to us before init_reply was processed. */
-static u8 **queued_msgs;
+static const u8 **queued_msgs;
 
 /* Our recorded channel balance at 'chain time' */
 static struct amount_msat our_msat;
 
+// /* If we broadcast a tx, or need a delay to resolve the output. */
+// struct proposed_resolution {
+// 	/* This can be NULL if our proposal is to simply ignore it after depth
+//       OR if we can make a transaction JIT (ELTOO_HTLC_{SUCESS/TIMEOUT}) */
+// 	const struct bitcoin_tx *tx;
+// 	/* Non-zero if this is CSV-delayed. */
+// 	u32 depth_required;
+// 	enum eltoo_tx_type tx_type;
+// };
+
 /* If we broadcast a tx, or need a delay to resolve the output. */
 struct proposed_resolution {
-	/* This can be NULL if our proposal is to simply ignore it after depth
+	/* Once we had lightningd create tx, here's what it told us
+	 * witnesses were (we ignore sigs!). */
+	/* NULL if answer is to simply ignore it. */
+	const struct onchain_witness_element **welements;
+    /* This can be NULL if our proposal is to simply ignore it after depth
       OR if we can make a transaction JIT (ELTOO_HTLC_{SUCESS/TIMEOUT}) */
 	const struct bitcoin_tx *tx;
 	/* Non-zero if this is CSV-delayed. */
@@ -137,21 +152,35 @@ static const char *output_type_name(enum output_type output_type)
 	return "unknown";
 }
 
+static const u8 *queue_until_msg(const tal_t *ctx, enum onchaind_wire mtype)
+{
+	const u8 *msg;
+
+	while ((msg = wire_sync_read(ctx, REQ_FD)) != NULL) {
+		if (fromwire_peektype(msg) == mtype)
+			return msg;
+		/* Process later */
+		tal_arr_expand(&queued_msgs, tal_steal(queued_msgs, msg));
+	}
+	status_failed(STATUS_FAIL_HSM_IO, "Waiting for %s: connection lost",
+		      onchaind_wire_name(mtype));
+}
+
 static u8 *htlc_timeout_to_us(const tal_t *ctx,
                  struct bitcoin_tx *tx,
                  const u8 *tapscript)
 {
-    return towire_hsmd_sign_eltoo_htlc_timeout_tx(ctx, 
+    return towire_hsmd_sign_eltoo_htlc_timeout_tx(ctx,
                              tx, tapscript);
 }
 
-static u8 *htlc_success_to_us(const tal_t *ctx,
-                 struct bitcoin_tx *tx,
-                 const u8 *tapscript)
-{
-    return towire_hsmd_sign_eltoo_htlc_success_tx(ctx, 
-                             tx, tapscript);
-}
+// static u8 *htlc_success_to_us(const tal_t *ctx,
+//                  struct bitcoin_tx *tx,
+//                  const u8 *tapscript)
+// {
+//     return towire_hsmd_sign_eltoo_htlc_success_tx(ctx,
+//                              tx, tapscript);
+// }
 
 static void send_coin_mvt(struct chain_coin_mvt *mvt TAKES)
 {
@@ -500,6 +529,11 @@ static void eltoo_proposal_meets_depth(struct tracked_output *out)
 				&out->proposal->tx_type, /* over-written if too small to care */
 				htlc_feerate,
 				NULL /* elem */, 0 /* elem_size */);
+            // msg = eltoo_onchaind_htlc_resolution_tx(NULL,
+            //                 &outs[i]->outpoint, outs[i]->sat,
+            //                 outs[i]->htlc_success_tapscript);
+            // propose_immediate_resolution(outs[i], take(msg),
+            //                 outs[i]->proposal->tx_type);
 		}
 	} else if (out->proposal->tx_type == ELTOO_HTLC_TIMEOUT_TO_THEM) {
 		// Not going to do anything to resolve this proposal here,
@@ -515,7 +549,7 @@ static void eltoo_proposal_meets_depth(struct tracked_output *out)
 
 	wire_sync_write(
 	    REQ_FD,
-	    take(towire_onchaind_broadcast_tx(
+	    take(towire_eltoo_onchaind_htlc_resolution_tx(
 		 NULL, out->proposal->tx,
 		 onchain_txtype_to_wallet_txtype(out->proposal->tx_type),
 		 is_rbf)));
@@ -528,70 +562,106 @@ static void eltoo_proposal_meets_depth(struct tracked_output *out)
 	/* Otherwise we will get a callback when it's in a block. */
 }
 
-static bool is_valid_sig(const u8 *e)
+// static bool is_valid_sig(const u8 *e)
+// {
+// 	struct bitcoin_signature sig;
+// 	return signature_from_der(e, tal_count(e), &sig);
+// }
+
+// /* We ignore things which look like signatures. */
+// static bool input_similar(const struct wally_tx_input *i1,
+// 			  const struct wally_tx_input *i2)
+// {
+// 	u8 *s1, *s2;
+
+// 	if (!memeq(i1->txhash, WALLY_TXHASH_LEN, i2->txhash, WALLY_TXHASH_LEN))
+// 		return false;
+
+// 	if (i1->index != i2->index)
+// 		return false;
+
+// 	if (!scripteq(i1->script, i2->script))
+// 		return false;
+
+// 	if (i1->sequence != i2->sequence)
+// 		return false;
+
+// 	if (i1->witness->num_items != i2->witness->num_items)
+// 		return false;
+
+// 	for (size_t i = 0; i < i1->witness->num_items; i++) {
+// 		/* Need to wrap these in `tal_arr`s since the primitives
+// 		 * except to be able to call tal_bytelen on them */
+// 		s1 = tal_dup_arr(tmpctx, u8, i1->witness->items[i].witness,
+// 				 i1->witness->items[i].witness_len, 0);
+// 		s2 = tal_dup_arr(tmpctx, u8, i2->witness->items[i].witness,
+// 				 i2->witness->items[i].witness_len, 0);
+
+// 		if (scripteq(s1, s2))
+// 			continue;
+
+// 		if (is_valid_sig(s1) && is_valid_sig(s2))
+// 			continue;
+// 		return false;
+// 	}
+
+// 	return true;
+// }
+
+/* Do any of these tx_parts spend this outpoint?  If so, return it */
+static const struct wally_tx_input *
+which_input_spends(const struct tx_parts *tx_parts,
+		   const struct bitcoin_outpoint *outpoint)
 {
-	struct bitcoin_signature sig;
-	return signature_from_der(e, tal_count(e), &sig);
+	for (size_t i = 0; i < tal_count(tx_parts->inputs); i++) {
+		struct bitcoin_outpoint o;
+		if (!tx_parts->inputs[i])
+			continue;
+		wally_tx_input_get_outpoint(tx_parts->inputs[i], &o);
+		if (!bitcoin_outpoint_eq(&o, outpoint))
+			continue;
+		return tx_parts->inputs[i];
+	}
+	return NULL;
 }
 
-/* We ignore things which look like signatures. */
-static bool input_similar(const struct wally_tx_input *i1,
-			  const struct wally_tx_input *i2)
+/* Does this tx input's witness match the witness we expected? */
+static bool onchain_witness_element_matches(const struct onchain_witness_element **welements,
+					    const struct wally_tx_input *input)
 {
-	u8 *s1, *s2;
-
-	if (!memeq(i1->txhash, WALLY_TXHASH_LEN, i2->txhash, WALLY_TXHASH_LEN))
+	const struct wally_tx_witness_stack *stack = input->witness;
+	if (stack->num_items != tal_count(welements))
 		return false;
-
-	if (i1->index != i2->index)
-		return false;
-
-	if (!scripteq(i1->script, i2->script))
-		return false;
-
-	if (i1->sequence != i2->sequence)
-		return false;
-
-	if (i1->witness->num_items != i2->witness->num_items)
-		return false;
-
-	for (size_t i = 0; i < i1->witness->num_items; i++) {
-		/* Need to wrap these in `tal_arr`s since the primitives
-		 * except to be able to call tal_bytelen on them */
-		s1 = tal_dup_arr(tmpctx, u8, i1->witness->items[i].witness,
-				 i1->witness->items[i].witness_len, 0);
-		s2 = tal_dup_arr(tmpctx, u8, i2->witness->items[i].witness,
-				 i2->witness->items[i].witness_len, 0);
-
-		if (scripteq(s1, s2))
+	for (size_t i = 0; i < stack->num_items; i++) {
+		/* Don't compare signatures: they can change with
+		 * other details */
+		if (welements[i]->is_signature)
 			continue;
-
-		if (is_valid_sig(s1) && is_valid_sig(s2))
-			continue;
-		return false;
+		if (!memeq(stack->items[i].witness,
+			   stack->items[i].witness_len,
+			   welements[i]->witness,
+			   tal_bytelen(welements[i]->witness)))
+			return false;
 	}
-
 	return true;
 }
+
 
 /* This simple case: true if this was resolved by our proposal. */
 static bool resolved_by_proposal(struct tracked_output *out,
 				 const struct tx_parts *tx_parts)
 {
+	const struct wally_tx_input *input;
+
 	/* If there's no TX associated, it's not us. */
-	if (!out->proposal->tx)
+	if (!out->proposal->welements)
 		return false;
 
-	/* Our proposal can change as feerates change.  Input
-	 * comparison (ignoring signatures) works pretty well. */
-	if (tal_count(tx_parts->inputs) != out->proposal->tx->wtx->num_inputs)
+	input = which_input_spends(tx_parts, &out->outpoint);
+	if (!input)
 		return false;
-
-	for (size_t i = 0; i < tal_count(tx_parts->inputs); i++) {
-		if (!input_similar(tx_parts->inputs[i],
-				   &out->proposal->tx->wtx->inputs[i]))
-			return false;
-	}
+	if (!onchain_witness_element_matches(out->proposal->welements, input))
+		return false;
 
 	out->resolved = tal(out, struct resolution);
 	out->resolved->txid = tx_parts->txid;
@@ -648,10 +718,25 @@ static size_t num_not_irrevocably_resolved(struct tracked_output **outs)
 	return num;
 }
 
+
+/* If a tx spends @out, and is CSV delayed by @delay, what's the first
+ * block it can get into? */
+static u32 rel_blockheight(const struct tracked_output *out, u32 delay)
+{
+	return out->tx_blockheight + delay;
+}
+
+/* What is the first block that the proposal can get into? */
 static u32 prop_blockheight(const struct tracked_output *out)
 {
-	return out->tx_blockheight + out->proposal->depth_required;
+	return rel_blockheight(out, out->proposal->depth_required);
 }
+
+
+// static u32 prop_blockheight(const struct tracked_output *out)
+// {
+// 	return out->tx_blockheight + out->proposal->depth_required;
+// }
 
 static void billboard_update(struct tracked_output **outs)
 {
@@ -716,32 +801,99 @@ static void billboard_update(struct tracked_output **outs)
 		       output_type_name(best->output_type), best->depth);
 }
 
-static void propose_resolution(struct tracked_output *out,
-                   const struct bitcoin_tx *tx,
-                   unsigned int depth_required,
-                   enum eltoo_tx_type tx_type)
+// static void propose_resolution(struct tracked_output *out,
+//                    const struct bitcoin_tx *tx,
+//                    unsigned int depth_required,
+//                    enum eltoo_tx_type tx_type)
+// {
+//     status_debug("Propose handling %s/%s by %s (%s) after %u blocks",
+//              eltoo_tx_type_name(out->tx_type),
+//              output_type_name(out->output_type),
+//              eltoo_tx_type_name(tx_type),
+//              tx ? type_to_string(tmpctx, struct bitcoin_tx, tx):"IGNORING",
+//              depth_required);
+
+//     out->proposal = tal(out, struct proposed_resolution);
+//     out->proposal->tx = tal_steal(out->proposal, tx);
+//     out->proposal->depth_required = depth_required;
+//     out->proposal->tx_type = tx_type;
+
+//     if (depth_required == 0)
+//         eltoo_proposal_meets_depth(out);
+// }
+
+static void handle_spend_created(struct tracked_output *out, const u8 *msg)
 {
-    status_debug("Propose handling %s/%s by %s (%s) after %u blocks",
-             eltoo_tx_type_name(out->tx_type),
-             output_type_name(out->output_type),
-             eltoo_tx_type_name(tx_type),
-             tx ? type_to_string(tmpctx, struct bitcoin_tx, tx):"IGNORING",
-             depth_required);
+	struct onchain_witness_element **witness;
+	bool worthwhile;
 
-    out->proposal = tal(out, struct proposed_resolution);
-    out->proposal->tx = tal_steal(out->proposal, tx);
-    out->proposal->depth_required = depth_required;
-    out->proposal->tx_type = tx_type;
+	if (!fromwire_onchaind_spend_created(tmpctx, msg, &worthwhile, &witness))
+		master_badmsg(WIRE_ONCHAIND_SPEND_CREATED, msg);
 
-    if (depth_required == 0)
-        eltoo_proposal_meets_depth(out);
+	out->proposal->welements
+		= cast_const2(const struct onchain_witness_element **,
+			      tal_steal(out->proposal, witness));
+
+	/* Did it decide it's not worth it?  Don't wait for it. */
+	if (!worthwhile)
+		ignore_output(out);
 }
+
+static struct proposed_resolution *new_proposed_resolution(struct tracked_output *out,
+							   unsigned int block_required,
+							   enum tx_type tx_type)
+{
+	struct proposed_resolution *proposal = tal(out, struct proposed_resolution);
+	proposal->tx_type = tx_type;
+	proposal->depth_required = block_required - out->tx_blockheight;
+
+	return proposal;
+}
+
+/* Modern style: we don't create tx outselves, but tell lightningd. */
+static void propose_resolution_to_master(struct tracked_output *out,
+					 const u8 *send_message TAKES,
+					 unsigned int block_required,
+					 enum eltoo_tx_type tx_type)
+{
+	/* i.e. we want this in @block_required, so it will be broadcast by
+	 * lightningd after it sees @block_required - 1. */
+	status_debug("Telling lightningd about %s to resolve %s/%s"
+		     " after block %u (%i more blocks)",
+		     eltoo_tx_type_name(tx_type),
+		     eltoo_tx_type_name(out->tx_type),
+		     output_type_name(out->output_type),
+		     block_required - 1, block_required - 1 - out->tx_blockheight);
+
+	out->proposal = new_proposed_resolution(out, block_required, tx_type);
+
+	wire_sync_write(REQ_FD, send_message);
+
+	/* Get reply now: if we're replaying, tx could be included before we
+	 * tell lightningd about it, so we need to recognize it! */
+	handle_spend_created(out,
+			     queue_until_msg(tmpctx, WIRE_ONCHAIND_SPEND_CREATED));
+}
+
+/* Create and broadcast this tx now */
+static void propose_immediate_resolution(struct tracked_output *out,
+					 const u8 *send_message TAKES,
+					 enum eltoo_tx_type tx_type)
+{
+	/* We add 1 to blockheight (meaning you can broadcast it now) to avoid
+	 * having to check for < 0 in various places we print messages */
+	propose_resolution_to_master(out, send_message, out->tx_blockheight+1,
+				     tx_type);
+}
+
+
 
 /* HTLC resolution won't have tx pre-built */
 static void propose_htlc_timeout_resolution(struct tracked_output *out,
                    unsigned int depth_required,
 				   enum eltoo_tx_type tx_type)
 {
+    const u8 *msg;
     status_debug("Propose handling %s/%s by %s after %u blocks",
              eltoo_tx_type_name(out->tx_type),
              output_type_name(out->output_type),
@@ -752,8 +904,50 @@ static void propose_htlc_timeout_resolution(struct tracked_output *out,
     out->proposal->depth_required = depth_required;
     out->proposal->tx_type = tx_type;
 
-    if (depth_required == 0)
-        eltoo_proposal_meets_depth(out);
+	// bool is_rbf = eltoo_proposal_is_rbfable(out->proposal);
+
+    if (depth_required != 0)
+       return;
+
+	/* Some transactions can be constructed just-in-time to have better fees if updated */
+	if (out->proposal->tx_type == ELTOO_HTLC_TIMEOUT) {
+		if (!out->proposal->welements) {
+			status_broken("Proposal tx already exists for HTLC timeout when it should be null. Stumbling through.");
+		} else {
+			status_debug("Creating HTLC timeout sweep transaction to be signed");
+			// out->proposal->welements = bip340_tx_to_us(out,
+			// 	htlc_timeout_to_us,
+			// 	out,
+			// 	out->htlc.cltv_expiry,
+			// 	out->htlc_timeout_tapscript,
+			// 	compute_control_block(out, out->htlc_success_tapscript /* other_script */, NULL /* annex_hint*/, &keyset->inner_pubkey, out->parity_bit),
+			// 	&out->proposal->tx_type, /* over-written if too small to care */
+			// 	htlc_feerate,
+			// 	NULL /* elem */, 0 /* elem_size */);
+
+            // status_debug("Broadcasting %s (%s) to resolve %s/%s",
+		    // eltoo_tx_type_name(out->proposal->tx_type),
+		    // type_to_string(tmpctx, struct onchain_witness_element *, out->proposal->welements),
+		    // eltoo_tx_type_name(out->tx_type),
+		    // output_type_name(out->output_type));
+
+            msg = towire_eltoo_onchaind_spend_to_us(NULL,
+                        &out->outpoint, out->sat,
+                        out->htlc_success_tapscript);
+            propose_immediate_resolution(out, take(msg),
+                        out->proposal->tx_type);
+
+		}
+	} else if (out->proposal->tx_type == ELTOO_HTLC_TIMEOUT_TO_THEM) {
+		// Not going to do anything to resolve this proposal here,
+		// instead we'll keep waiting for HTLC preimage
+		return;
+	}
+
+	/* Don't wait for this if we're ignoring the tiny payment. */
+	if (out->proposal->tx_type == ELTOO_IGNORING_TINY_PAYMENT) {
+		ignore_output(out);
+	}
 }
 
 /* HTLC resolution won't have tx pre-built */
@@ -951,13 +1145,17 @@ static void eltoo_handle_preimage(struct tracked_output **outs,
 	size_t i;
 	struct sha256 sha;
 	struct ripemd160 ripemd;
+    const u8 *msg;
+	// u8 *wscript = bitcoin_wscript_htlc_tx(tmpctx, to_self_delay[LOCAL],
+	// 				      &keyset->self_revocation_key,
+	// 				      &keyset->self_delayed_payment_key);
 
 	sha256(&sha, &preimage, sizeof(preimage));
 	ripemd160(&ripemd, &sha, sizeof(sha));
 
 	for (i = 0; i < tal_count(outs); i++) {
-        struct bitcoin_tx *tx;
-        enum eltoo_tx_type tx_type = ELTOO_HTLC_SUCCESS;
+        // struct bitcoin_tx *tx;
+        // enum eltoo_tx_type tx_type = ELTOO_HTLC_SUCCESS;
 
 		if (outs[i]->output_type != THEIR_HTLC)
 			continue;
@@ -981,18 +1179,25 @@ static void eltoo_handle_preimage(struct tracked_output **outs,
 		outs[i]->proposal = tal_free(outs[i]->proposal);
 
 		status_debug("Creating HTLC success sweep transaction to be signed");
-        tx = bip340_tx_to_us(outs[i],
-            htlc_success_to_us,
-            outs[i],
-            0 /* locktime */,
-            outs[i]->htlc_success_tapscript,
-            compute_control_block(outs[i], outs[i]->htlc_timeout_tapscript /* other_script */, NULL /* annex_hint*/, &keyset->inner_pubkey, outs[i]->parity_bit),
-            &tx_type, /* over-written if too small to care */
-            htlc_feerate,
-			&preimage,
-			sizeof(preimage));
+        // tx = bip340_tx_to_us(outs[i],
+        //     htlc_success_to_us,
+        //     outs[i],
+        //     0 /* locktime */,
+        //     outs[i]->htlc_success_tapscript,
+        //     compute_control_block(outs[i], outs[i]->htlc_timeout_tapscript /* other_script */, NULL /* annex_hint*/, &keyset->inner_pubkey, outs[i]->parity_bit),
+        //     &tx_type, /* over-written if too small to care */
+        //     htlc_feerate,
+		// 	&preimage,
+		// 	sizeof(preimage));
 
-        propose_resolution(outs[i], tx, 0 /* depth_required */, tx_type);
+        // propose_resolution(outs[i], tx, 0 /* depth_required */, tx_type);
+
+        msg = towire_eltoo_onchaind_spend_to_us(NULL,
+                        &outs[i]->outpoint, outs[i]->sat,
+                        outs[i]->htlc_success_tapscript);
+        propose_immediate_resolution(outs[i], take(msg),
+                        outs[i]->proposal->tx_type);
+
 	}
 }
 
@@ -1052,6 +1257,7 @@ static void output_spent(struct tracked_output ***outs,
             struct amount_asset asset;
             struct amount_sat amt;
             struct tracked_output *new_state_out;
+            const u8 *msg;
 
             asset = wally_tx_output_get_amount(tx_parts->outputs[input_num]);
             amt = amount_asset_to_sat(&asset);
@@ -1063,10 +1269,21 @@ static void output_spent(struct tracked_output ***outs,
 
             if (locktime == complete_update_tx->wtx->locktime) {
                 bind_settle_tx(tx_parts->txid, input_num, complete_settle_tx);
-                propose_resolution(new_state_out, complete_settle_tx,  complete_settle_tx->wtx->inputs[0].sequence /* depth_required */, ELTOO_SETTLE);
+                // propose_resolution(new_state_out, complete_settle_tx,  complete_settle_tx->wtx->inputs[0].sequence /* depth_required */, ELTOO_SETTLE);
+                // msg = towire_eltoo_onchaind_settlement(NULL,
+                //     &new_state_out, complete_settle_tx);
+                msg = towire_eltoo_onchaind_settlement(
+                        NULL, complete_settle_tx,
+                        onchain_txtype_to_wallet_txtype(out->proposal->tx_type),
+                        false);
+                propose_resolution_to_master(new_state_out, take(msg),  prop_blockheight(new_state_out) /* depth_required */, ELTOO_SETTLE);
             } else if (committed_update_tx && locktime == committed_update_tx->wtx->locktime) {
                 bind_settle_tx(tx_parts->txid, input_num, committed_settle_tx);
-                propose_resolution(new_state_out, committed_settle_tx, committed_settle_tx->wtx->inputs[0].sequence /* depth_required */, ELTOO_SETTLE);
+                msg = towire_eltoo_onchaind_settlement(
+                        NULL, complete_settle_tx,
+                        onchain_txtype_to_wallet_txtype(out->proposal->tx_type),
+                        false);
+                propose_resolution_to_master(new_state_out, take(msg),  prop_blockheight(new_state_out) /* depth_required */, ELTOO_SETTLE);
             } else if ((committed_update_tx && locktime > committed_update_tx->wtx->locktime) ||
                 (!committed_update_tx && locktime > complete_update_tx->wtx->locktime)) {
                 /* If we get lucky the settle transaction will hit chain and we can get balance back */
@@ -1088,7 +1305,12 @@ static void output_spent(struct tracked_output ***outs,
                             invalidated_update_num,
                             &keyset->inner_pubkey,
                             &sig);
-                propose_resolution(new_state_out, complete_update_tx, 0 /* depth_required */, ELTOO_UPDATE);
+                msg = towire_eltoo_onchaind_update(
+                        NULL, complete_update_tx,
+                        onchain_txtype_to_wallet_txtype(out->proposal->tx_type),
+                        false);
+                propose_resolution_to_master(new_state_out, take(msg),  prop_blockheight(new_state_out) /* depth_required */, ELTOO_SETTLE);
+                // propose_resolution(new_state_out, complete_update_tx, 0 /* depth_required */, ELTOO_UPDATE);
 
                 /* Inform master of latest known state output to rebind to over RPC responses
                  * We don't send complete/committed_tx state outputs or future ones */
@@ -1128,6 +1350,7 @@ static void output_spent(struct tracked_output ***outs,
             case ANCHOR_TO_US:
             case ANCHOR_TO_THEM:
             case FUNDING_OUTPUT:
+            case EPHEMERAL_ANCHOR:
                 status_failed(STATUS_FAIL_INTERNAL_ERROR,
                           "Tracked spend of %s/%s?",
                           eltoo_tx_type_name(out->tx_type),
@@ -1236,13 +1459,10 @@ static void eltoo_tx_new_depth(struct tracked_output **outs,
 
 static void memleak_remove_globals(struct htable *memtable, const tal_t *topctx)
 {
-	if (keyset)
-		memleak_remove_region(memtable, keyset, sizeof(*keyset));
-	memleak_remove_pointer(memtable, topctx);
-	memleak_remove_region(memtable,
-			      missing_htlc_msgs, tal_bytelen(missing_htlc_msgs));
-	memleak_remove_region(memtable,
-			      queued_msgs, tal_bytelen(queued_msgs));
+	memleak_scan_obj(memtable, keyset);
+	memleak_ptr(memtable, topctx);
+	memleak_scan_obj(memtable, missing_htlc_msgs);
+	memleak_scan_obj(memtable, queued_msgs);
 }
 
 static bool handle_dev_memleak(struct tracked_output **outs, const u8 *msg)
@@ -1253,10 +1473,12 @@ static bool handle_dev_memleak(struct tracked_output **outs, const u8 *msg)
 	if (!fromwire_onchaind_dev_memleak(msg))
 		return false;
 
-	memtable = memleak_find_allocations(tmpctx, msg, msg);
+	memtable = memleak_start(tmpctx);
+	memleak_ptr(memtable, msg);
+
 	/* Top-level context is parent of outs */
 	memleak_remove_globals(memtable, tal_parent(outs));
-	memleak_remove_region(memtable, outs, tal_bytelen(outs));
+	memleak_scan_obj(memtable, *outs);
 
 	found_leak = dump_memleak(memtable, memleak_status_broken, NULL);
 	wire_sync_write(REQ_FD,
@@ -1270,7 +1492,7 @@ static void wait_for_mutual_resolved(struct tracked_output **outs)
 	billboard_update(outs);
 
 	while (num_not_irrevocably_resolved(outs) != 0) {
-		u8 *msg;
+		const u8 *msg;
 		struct bitcoin_txid txid;
 		u32 depth;
 
@@ -1308,7 +1530,7 @@ static void wait_for_resolved(struct tracked_output **outs, struct htlcs_info *h
     u8 **htlc_timeout_scripts = derive_htlc_timeout_scripts(outs, htlcs_info->htlcs, &keyset->self_settle_key, &keyset->other_settle_key);
 
 	while (num_not_irrevocably_resolved(outs) != 0) {
-		u8 *msg;
+		const u8 *msg;
 		struct bitcoin_txid txid;
 		u32 input_num, depth, tx_blockheight;
 		struct preimage preimage;
@@ -1465,6 +1687,7 @@ static void handle_unilateral(const struct tx_parts *tx,
     struct tracked_output *out;
     const struct pubkey *funding_pubkey_ptrs[2];
     secp256k1_musig_keyagg_cache keyagg_cache;
+    const u8 *msg;
 
     /* State output will match index */
     int state_index = funding_input_num(outs, tx);
@@ -1505,12 +1728,23 @@ static void handle_unilateral(const struct tx_parts *tx,
     if (locktime == complete_update_tx->wtx->locktime) {
         status_debug("Handling the final complete update transaction.");
         bind_settle_tx(tx->txid, state_index, complete_settle_tx);
-        propose_resolution(out, complete_settle_tx,  complete_settle_tx->wtx->inputs[0].sequence /* depth_required */, ELTOO_SETTLE);
+        // bind_settle_tx(tx_parts->txid, input_num, committed_settle_tx);
+        msg = towire_eltoo_onchaind_settlement(
+                NULL, complete_settle_tx,
+                onchain_txtype_to_wallet_txtype(out->proposal->tx_type),
+                false);
+        propose_resolution_to_master(out, take(msg),  prop_blockheight(out) /* block_required */, ELTOO_SETTLE);
+        // propose_resolution(out, complete_settle_tx,  complete_settle_tx->wtx->inputs[0].sequence /* depth_required */, ELTOO_SETTLE);
     } else if (committed_update_tx && locktime == committed_update_tx->wtx->locktime) {
         u8 *empty_hint = tal_arr(tmpctx, u8, 0); /* Make sure this doesn't sit around forever */
         status_debug("Handling the final committed update transaction.");
         bind_settle_tx(tx->txid, state_index, committed_settle_tx);
-        propose_resolution(out, committed_settle_tx, committed_settle_tx->wtx->inputs[0].sequence /* depth_required */, ELTOO_SETTLE);
+        // propose_resolution(out, committed_settle_tx, committed_settle_tx->wtx->inputs[0].sequence /* depth_required */, ELTOO_SETTLE);
+        msg = towire_eltoo_onchaind_settlement(
+                NULL, complete_settle_tx,
+                onchain_txtype_to_wallet_txtype(out->proposal->tx_type),
+                false);
+        propose_resolution_to_master(out, take(msg),  prop_blockheight(out) /* block_required */, ELTOO_SETTLE);
 
         /* Give hint to how to rebind the committed settle tx */
         wire_sync_write(REQ_FD,
@@ -1535,7 +1769,13 @@ static void handle_unilateral(const struct tx_parts *tx,
                     invalidated_update_num,
                     &keyset->inner_pubkey,
                     &sig);
-        propose_resolution(out, complete_update_tx, 0 /* depth_required */, ELTOO_UPDATE);
+        // propose_resolution(out, complete_update_tx, 0 /* depth_required */, ELTOO_UPDATE);
+        /* FIXME have master create the txes instead of onchaind, ugly hack for now */
+        msg = towire_eltoo_onchaind_update(
+                NULL, complete_update_tx,
+                onchain_txtype_to_wallet_txtype(out->proposal->tx_type),
+                false);
+        propose_resolution_to_master(out, take(msg),  prop_blockheight(out) /* block_required */, ELTOO_UPDATE);
 
         /* Inform master of latest known state output to rebind to over RPC responses
          * We don't send complete/committed_tx state outputs or future ones */
@@ -1570,7 +1810,7 @@ int main(int argc, char *argv[])
 	status_setup_sync(REQ_FD);
 
     missing_htlc_msgs = tal_arr(ctx, u8 *, 0);
-    queued_msgs = tal_arr(ctx, u8 *, 0);
+    queued_msgs = tal_arr(ctx, const u8 *, 0);
     /* Since eltoo is not "one shot", we have to wait to process
      * preimage notifications until settlement tx is mined or
      * we switch how we track settlement outputs prior to mining.

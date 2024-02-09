@@ -1697,6 +1697,10 @@ static void wait_for_resolved(struct tracked_output **outs)
 		case WIRE_ELTOO_ONCHAIND_INIT:
 		case WIRE_ELTOO_ONCHAIND_INIT_REPLY:
 		case WIRE_ELTOO_ONCHAIND_NEW_STATE_OUTPUT:
+		case WIRE_ELTOO_ONCHAIND_UPDATE:
+		case WIRE_ELTOO_ONCHAIND_SETTLEMENT:
+		case WIRE_ELTOO_ONCHAIND_HTLC_RESOLUTION_TX:
+		case WIRE_ELTOO_ONCHAIND_SPEND_TO_US:
 
 		/* We send these, not receive! */
 		case WIRE_ONCHAIND_INIT_REPLY:
