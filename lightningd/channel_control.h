@@ -10,12 +10,16 @@ struct lightningd;
 struct peer_fd;
 struct peer;
 
-void peer_start_eltoo_channeld(struct channel *channel, struct peer_fd *peer_fd,
-			       const u8 *fwd_msg, bool reconnected,
-			       bool reestablish_only);
+bool peer_start_eltoo_channeld(struct channel *channel,
+			 struct peer_fd *peer_fd,
+			 const u8 *fwd_msg,
+			 bool reconnected,
+			 bool reestablish_only);
 
-bool peer_start_channeld(struct channel *channel, struct peer_fd *peer_fd,
-			 const u8 *fwd_msg, bool reconnected,
+bool peer_start_channeld(struct channel *channel,
+			 struct peer_fd *peer_fd,
+			 const u8 *fwd_msg,
+			 bool reconnected,
 			 bool reestablish_only);
 
 /* Send message to channeld (if connected) to tell it about depth
@@ -32,7 +36,7 @@ struct command_result *cancel_channel_before_broadcast(struct command *cmd,
 						       struct peer *peer);
 
 /* Update the channel info on funding locked eltoo*/
-bool channel_on_funding_locked_eltoo(struct channel *channel);
+bool channel_on_channel_ready_eltoo(struct channel *channel);
 
 /* Update the channel info on channel_ready */
 bool channel_on_channel_ready(struct channel *channel,

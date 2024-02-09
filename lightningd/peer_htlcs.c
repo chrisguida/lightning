@@ -2023,7 +2023,7 @@ static bool peer_save_updatesig_received(
 
 	/* Update transactions before saving to db */
 	channel_set_last_eltoo_txs(channel, update_tx, settle_tx, their_psig,
-				   our_psig, session, TX_CHANNEL_UNILATERAL);
+				   our_psig, session);
 
 	return true;
 }

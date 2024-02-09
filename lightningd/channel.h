@@ -749,8 +749,7 @@ void channel_set_last_eltoo_txs(struct channel *channel,
 				struct bitcoin_tx *settle_tx,
 				struct partial_sig *their_psig,
 				struct partial_sig *our_psig,
-				struct musig_session *session,
-				enum wallet_tx_type type);
+				struct musig_session *session);
 
 void channel_set_last_tx(struct channel *channel, struct bitcoin_tx *tx,
 			 const struct bitcoin_signature *sig);
