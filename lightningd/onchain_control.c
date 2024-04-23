@@ -1228,6 +1228,170 @@ static void handle_eltoo_onchaind_spend_to_us(struct channel *channel, const u8 
 			  sign_tx_to_us, info, __func__);
 }
 
+/** handle_onchain_broadcast_rbf_tx_cb
+ *
+ * @brief suppresses the rebroadcast of a
+ * transaction.
+ *
+ * @desc when using the `bitcoin_tx` function,
+ * if a callback is not given, the transaction
+ * will be rebroadcast automatically by
+ * chaintopology.
+ * However, in the case of an RBF transaction
+ * from `onchaind`, `onchaind` will periodically
+ * create a new, higher-fee replacement, thus
+ * `onchaind` will trigger rebroadcast (with a
+ * higher fee) by itself, which the `lightningd`
+ * chaintopology should not repeat.
+ * This callback exists to suppress the
+ * rebroadcast behavior of chaintopology.
+ *
+ * @param channel - the channel for which the
+ * transaction was broadcast.
+ * @param success - whether the tx was broadcast.
+ * @param err - the error received from the
+ * underlying sendrawtx.
+ */
+static void handle_onchain_broadcast_rbf_tx_cb(struct channel *channel,
+					       bool success,
+					       const char *err)
+{
+	/* Victory is boring.  */
+	if (success)
+		return;
+
+	/* Failure is unusual but not broken: it is possible that just
+	 * as we were about to broadcast, a new block came in which
+	 * contains a previous version of the transaction, thus
+	 * causing the higher-fee replacement to fail broadcast.
+	 *
+	 * ...or it could be a bug in onchaind which prevents it from
+	 * successfully RBFing out the transaction, in which case we
+	 * should log it for devs to check.
+	 */
+	log_unusual(channel->log,
+		    "Broadcast of RBF tx failed, "
+		    "did a new block just come in? "
+		    "error: %s",
+		    err);
+}
+
+static void handle_onchain_broadcast_tx(struct channel *channel,
+					const u8 *msg)
+{
+	struct bitcoin_tx *tx;
+	struct wallet *w = channel->peer->ld->wallet;
+	struct bitcoin_txid txid;
+	enum wallet_tx_type type;
+	bool is_rbf;
+
+	if (!fromwire_onchaind_broadcast_tx(msg, msg, &tx, &type, &is_rbf)) {
+		channel_internal_error(channel, "Invalid onchain_broadcast_tx");
+		return;
+	}
+
+	tx->chainparams = chainparams;
+
+	bitcoin_txid(tx, &txid);
+	wallet_transaction_add(w, tx->wtx, 0, 0);
+	wallet_transaction_annotate(w, &txid, type, channel->dbid);
+
+	/* We don't really care if it fails, we'll respond via watch. */
+	/* If the onchaind signals this as RBF-able, then we also
+	 * set allowhighfees, as the transaction may be RBFed into
+	 * high feerates as protection against the MAD-HTLC attack.  */
+	broadcast_tx_(channel->peer->ld->topology, channel,
+			 tx, is_rbf,
+			 is_rbf ? &handle_onchain_broadcast_rbf_tx_cb : NULL);
+}
+
+static void handle_eltoo_onchaind_update(struct channel *channel,
+					const u8 *msg)
+{
+	struct bitcoin_tx *tx;
+	struct wallet *w = channel->peer->ld->wallet;
+	struct bitcoin_txid txid;
+	enum wallet_tx_type type;
+	bool is_rbf;
+
+	if (!fromwire_onchaind_broadcast_tx(msg, msg, &tx, &type, &is_rbf)) {
+		channel_internal_error(channel, "Invalid onchain_broadcast_tx");
+		return;
+	}
+
+	tx->chainparams = chainparams;
+
+	bitcoin_txid(tx, &txid);
+	wallet_transaction_add(w, tx->wtx, 0, 0);
+	wallet_transaction_annotate(w, &txid, type, channel->dbid);
+
+	/* We don't really care if it fails, we'll respond via watch. */
+	/* If the onchaind signals this as RBF-able, then we also
+	 * set allowhighfees, as the transaction may be RBFed into
+	 * high feerates as protection against the MAD-HTLC attack.  */
+	broadcast_tx_ahf(channel->peer->ld->topology, channel,
+			 tx, is_rbf,
+			 is_rbf ? &handle_onchain_broadcast_rbf_tx_cb : NULL);
+}
+
+static void handle_eltoo_onchaind_settlement(struct channel *channel,
+					const u8 *msg)
+{
+	struct bitcoin_tx *tx;
+	struct wallet *w = channel->peer->ld->wallet;
+	struct bitcoin_txid txid;
+	enum wallet_tx_type type;
+	bool is_rbf;
+
+	if (!fromwire_onchaind_broadcast_tx(msg, msg, &tx, &type, &is_rbf)) {
+		channel_internal_error(channel, "Invalid onchain_broadcast_tx");
+		return;
+	}
+
+	tx->chainparams = chainparams;
+
+	bitcoin_txid(tx, &txid);
+	wallet_transaction_add(w, tx->wtx, 0, 0);
+	wallet_transaction_annotate(w, &txid, type, channel->dbid);
+
+	/* We don't really care if it fails, we'll respond via watch. */
+	/* If the onchaind signals this as RBF-able, then we also
+	 * set allowhighfees, as the transaction may be RBFed into
+	 * high feerates as protection against the MAD-HTLC attack.  */
+	broadcast_tx_ahf(channel->peer->ld->topology, channel,
+			 tx, is_rbf,
+			 is_rbf ? &handle_onchain_broadcast_rbf_tx_cb : NULL);
+}
+
+static void handle_eltoo_onchaind_htlc_resolution_tx(struct channel *channel,
+					const u8 *msg)
+{
+	struct bitcoin_tx *tx;
+	struct wallet *w = channel->peer->ld->wallet;
+	struct bitcoin_txid txid;
+	enum wallet_tx_type type;
+	bool is_rbf;
+
+	if (!fromwire_onchaind_broadcast_tx(msg, msg, &tx, &type, &is_rbf)) {
+		channel_internal_error(channel, "Invalid onchain_broadcast_tx");
+		return;
+	}
+
+	tx->chainparams = chainparams;
+
+	bitcoin_txid(tx, &txid);
+	wallet_transaction_add(w, tx->wtx, 0, 0);
+	wallet_transaction_annotate(w, &txid, type, channel->dbid);
+
+	/* We don't really care if it fails, we'll respond via watch. */
+	/* If the onchaind signals this as RBF-able, then we also
+	 * set allowhighfees, as the transaction may be RBFed into
+	 * high feerates as protection against the MAD-HTLC attack.  */
+	broadcast_tx_ahf(channel->peer->ld->topology, channel,
+			 tx, is_rbf,
+			 is_rbf ? &handle_onchain_broadcast_rbf_tx_cb : NULL);
+}
+
 static void handle_onchaind_spend_penalty(struct channel *channel,
 					  const u8 *msg)
 {
@@ -1602,6 +1766,10 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg,
 		handle_onchain_init_reply(sd->channel, msg);
 		break;
 
+	case WIRE_ONCHAIND_BROADCAST_TX:
+		handle_onchain_broadcast_tx(sd->channel, msg);
+		break;
+
 	case WIRE_ELTOO_ONCHAIND_INIT_REPLY:
 		handle_eltoo_onchain_init_reply(sd->channel, msg);
 		break;
@@ -1650,6 +1818,18 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg,
 		handle_eltoo_onchaind_spend_to_us(sd->channel, msg);
 		break;
 
+	case WIRE_ELTOO_ONCHAIND_UPDATE:
+		handle_eltoo_onchaind_update(sd->channel, msg);
+		break;
+
+	case WIRE_ELTOO_ONCHAIND_SETTLEMENT:
+		handle_eltoo_onchaind_settlement(sd->channel, msg);
+		break;
+
+	case WIRE_ELTOO_ONCHAIND_HTLC_RESOLUTION_TX:
+		handle_eltoo_onchaind_htlc_resolution_tx(sd->channel, msg);
+		break;
+
 	case WIRE_ONCHAIND_SPEND_PENALTY:
 		handle_onchaind_spend_penalty(sd->channel, msg);
 		break;
@@ -1682,7 +1862,6 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg,
 		break;
 	/* These are illegal */
 	case WIRE_ELTOO_ONCHAIND_INIT:
-	// case WIRE_ELTOO_ONCHAIND_INIT_REPLY:
 	case WIRE_ELTOO_ONCHAIND_NEW_STATE_OUTPUT:
 		abort();
 	}

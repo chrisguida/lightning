@@ -260,6 +260,32 @@ static void broadcast_done(struct bitcoind *bitcoind, bool success,
 	tal_add_destructor2(otx, destroy_outgoing_tx, bitcoind->ld->topology);
 }
 
+// void broadcast_tx_ahf(struct chain_topology *topo,
+// 		      struct channel *channel, const struct bitcoin_tx *tx,
+// 		      bool allowhighfees,
+// 		      void (*failed)(struct channel *channel,
+// 				     bool success,
+// 				     const char *err))
+// {
+// 	/* Channel might vanish: topo owns it to start with. */
+// 	struct outgoing_tx *otx = tal(topo, struct outgoing_tx);
+// 	const u8 *rawtx = linearize_tx(otx, tx);
+
+// 	otx->channel = channel;
+// 	bitcoin_txid(tx, &otx->txid);
+// 	otx->hextx = tal_hex(otx, rawtx);
+// 	otx->failed_or_success = failed;
+// 	tal_free(rawtx);
+// 	tal_add_destructor2(channel, clear_otx_channel, otx);
+
+// 	log_debug(topo->log, "Broadcasting txid %s",
+// 		  type_to_string(tmpctx, struct bitcoin_txid, &otx->txid));
+
+// 	wallet_transaction_add(topo->ld->wallet, tx->wtx, 0, 0);
+// 	bitcoind_sendrawtx_ahf(topo->bitcoind, otx->hextx, allowhighfees,
+// 			       broadcast_done, otx);
+// }
+
 void broadcast_tx_(const tal_t *ctx, struct chain_topology *topo,
 		   struct channel *channel, const struct bitcoin_tx *tx,
 		   const char *cmd_id, bool allowhighfees, u32 minblock,
