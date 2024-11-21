@@ -1,4 +1,5 @@
 #include "config.h"
+#include <bitcoin/chainparams.h>
 #include <bitcoin/tx.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
@@ -363,7 +364,8 @@ static int dump_commitments_infos(struct node_id *node_id, u64 channel_id,
 {
 	struct sha256 shaseed;
 	struct secret hsm_secret, channel_seed, per_commitment_secret;
-	struct pubkey per_commitment_point;
+	struct pubkey per_commitment_point, local_funding_pubkey;
+	struct secrets secrets;
 
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
 	                                         | SECP256K1_CONTEXT_SIGN);
@@ -373,6 +375,7 @@ static int dump_commitments_infos(struct node_id *node_id, u64 channel_id,
 
 	derive_shaseed(&channel_seed, &shaseed);
 	printf("shaseed: %s\n", fmt_sha256(tmpctx, &shaseed));
+	printf("channel_seed: %s\n", fmt_secret(tmpctx, &channel_seed));
 	for (u64 i = 0; i < depth; i++) {
 		if (!per_commit_secret(&shaseed, &per_commitment_secret, i))
 			errx(ERROR_KEYDERIV, "Could not derive secret #%"PRIu64, i);
@@ -385,6 +388,12 @@ static int dump_commitments_infos(struct node_id *node_id, u64 channel_id,
 		       i, fmt_pubkey(tmpctx, &per_commitment_point));
 	}
 
+	// DERIVE FUNDING PUBKEY AND PRIVKEY FOR ARBITRARY CHANNEL CLOSE TXS
+	chainparams = chainparams_for_network("bitcoin");
+	derive_basepoints(&channel_seed,
+		&local_funding_pubkey, NULL, &secrets, NULL);
+	printf("local_funding_pubkey: %s\n", fmt_pubkey(tmpctx, &local_funding_pubkey));
+	printf("secrets.funding_privkey: %s\n", fmt_privkey(tmpctx, &secrets.funding_privkey));
 	return 0;
 }
 

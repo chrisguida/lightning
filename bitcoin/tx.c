@@ -615,8 +615,10 @@ static struct wally_tx *pull_wtx(const tal_t *ctx,
 		fromwire_fail(cursor, max);
 		wtx = tal_free(wtx);
 	}
-	tal_wally_end_onto(ctx, wtx, struct wally_tx);
 
+	// can't get this function to work with dumpcommitments
+	// tal_wally_end_onto(ctx, wtx, struct wally_tx);
+	tal_wally_end(wtx);
 	if (wtx) {
 		size_t wsize;
 		wally_tx_get_length(wtx, flags, &wsize);

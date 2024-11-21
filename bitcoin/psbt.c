@@ -30,8 +30,10 @@ struct wally_psbt *create_psbt(const tal_t *ctx, size_t num_inputs, size_t num_o
 	wally_psbt_set_fallback_locktime(psbt, locktime);
 	/* By default we are modifying them internally; allow it */
 	wally_psbt_set_tx_modifiable_flags(psbt, WALLY_PSBT_TXMOD_INPUTS | WALLY_PSBT_TXMOD_OUTPUTS);
-	tal_add_destructor(psbt, psbt_destroy);
-	tal_wally_end_onto(ctx, psbt, struct wally_psbt);
+	// this breaks dumpcommitments but removing it probably causes memleaks
+	// tal_add_destructor(psbt, psbt_destroy);
+	// tal_wally_end_onto(ctx, psbt, struct wally_psbt);
+	tal_wally_end(psbt);
 
 	return psbt;
 }
